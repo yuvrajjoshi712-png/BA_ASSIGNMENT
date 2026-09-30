@@ -191,76 +191,26 @@ def clean_secret(value: Optional[str]) -> Optional[str]:
 
 # The app supports both providers. If Gemini is configured, it is used first;
 # otherwise OpenRouter is used. Gemini 2.5 Flash-Lite currently has a free tier.
-GEMINI_API_KEY = clean_secret(get_secret("GEMINI_API_KEY"))
-GEMINI_MODEL = get_secret("GEMINI_MODEL", "gemini-2.5-flash-lite")
 OPENROUTER_API_KEY = clean_secret(get_secret("OPENROUTER_API_KEY"))
 OPENROUTER_MODEL = get_secret("OPENROUTER_MODEL", "openrouter/free")
-LLM_PROVIDER = get_secret("LLM_PROVIDER", "auto").lower().strip()
 
 
-def available_provider() -> Optional[str]:
-    if LLM_PROVIDER == "gemini":
-        return "gemini" if GEMINI_API_KEY else None
-    if LLM_PROVIDER == "openrouter":
-        return "openrouter" if OPENROUTER_API_KEY else None
-    if GEMINI_API_KEY:
-        return "gemini"
-    if OPENROUTER_API_KEY:
-        return "openrouter"
-    return None
+def call_openrouter(
+    system: str,
+    messages: List[Dict[str, str]],
+    temperature: float = 0.2,
+    max_tokens: int = 900,
+) -> Tuple[Optional[str], Optional[str]]:
+    """Call OpenRouter directly. The existing ML model is not changed here."""
+    if not OPENROUTER_API_KEY:
+        return None, "OPENROUTER_API_KEY is not configured in Streamlit Secrets."
 
+    api_key = clean_secret(OPENROUTER_API_KEY)
+    if not api_key:
+        return None, "OPENROUTER_API_KEY is empty."
 
-def call_gemini(system: str, messages: List[Dict[str, str]], temperature: float, max_tokens: int) -> Tuple[Optional[str], Optional[str]]:
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
     headers = {
-        "x-goog-api-key": GEMINI_API_KEY,
-        "Content-Type": "application/json",
-    }
-
-    contents = []
-    for message in messages:
-        role = message.get("role", "user")
-        if role == "assistant":
-            role = "model"
-        if role == "system":
-            continue
-        contents.append({"role": role, "parts": [{"text": str(message.get("content", ""))}]})
-
-    payload = {
-        "systemInstruction": {"parts": [{"text": system}]},
-        "contents": contents,
-        "generationConfig": {
-            "temperature": temperature,
-            "maxOutputTokens": max_tokens,
-        },
-    }
-
-    try:
-        response = requests.post(url, headers=headers, json=payload, timeout=45)
-        if not response.ok:
-            try:
-                body = response.json()
-            except ValueError:
-                body = response.text[:1000]
-            return None, f"Gemini HTTP {response.status_code}: {body}"
-        data = response.json()
-        candidates = data.get("candidates", [])
-        if not candidates:
-            return None, "Gemini returned no candidates."
-        parts = candidates[0].get("content", {}).get("parts", [])
-        text_parts = [p.get("text", "") for p in parts if p.get("text")]
-        text = "\n".join(text_parts).strip()
-        return (text, None) if text else (None, "Gemini returned an empty response.")
-    except requests.RequestException as exc:
-        return None, f"Gemini request failed: {exc}"
-    except (ValueError, KeyError, IndexError, TypeError) as exc:
-        return None, f"Could not read Gemini response: {exc}"
-
-
-def call_openrouter(system: str, messages: List[Dict[str, str]], temperature: float, max_tokens: int) -> Tuple[Optional[str], Optional[str]]:
-    url = "https://openrouter.ai/api/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Authorization": "Bearer " + api_key,
         "Content-Type": "application/json",
         "HTTP-Referer": "https://streamlit.io/",
         "X-Title": "Zwigato Delivery Delay Predictor",
@@ -273,43 +223,48 @@ def call_openrouter(system: str, messages: List[Dict[str, str]], temperature: fl
     }
 
     try:
-        response = requests.post(url, headers=headers, json=payload, timeout=45)
-        if not response.ok:
-            try:
-                body = response.json()
-            except ValueError:
-                body = response.text[:1000]
-            return None, f"OpenRouter HTTP {response.status_code}: {body}"
-        data = response.json()
-        text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-        return (text.strip(), None) if text else (None, "OpenRouter returned an empty response.")
+        response = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=45,
+        )
     except requests.RequestException as exc:
         return None, f"OpenRouter request failed: {exc}"
+
+    if response.status_code == 401:
+        return None, (
+            "OpenRouter authentication failed (HTTP 401). Check Streamlit Secrets: "
+            "OPENROUTER_API_KEY must contain only the key value, without 'Bearer '."
+        )
+
+    if not response.ok:
+        try:
+            body = response.json()
+        except ValueError:
+            body = response.text[:1000]
+        return None, f"OpenRouter HTTP {response.status_code}: {body}"
+
+    try:
+        data = response.json()
+        text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
     except (ValueError, KeyError, IndexError, TypeError) as exc:
         return None, f"Could not read OpenRouter response: {exc}"
 
+    if not text:
+        return None, "OpenRouter returned an empty response."
 
-def call_llm(system: str, messages: List[Dict[str, str]], temperature: float = 0.2, max_tokens: int = 900) -> Tuple[Optional[str], Optional[str]]:
-    """Call the configured provider. In auto mode, try Gemini then OpenRouter."""
-    provider = available_provider()
-    if not provider:
-        return None, "No LLM API key is configured."
+    return text.strip(), None
 
-    if provider == "gemini":
-        content, error = call_gemini(system, messages, temperature, max_tokens)
-        if content:
-            return content, None
-        # In auto mode, fall back to OpenRouter if it is also configured.
-        if LLM_PROVIDER == "auto" and OPENROUTER_API_KEY:
-            return call_openrouter(system, messages, temperature, max_tokens)
-        return None, error
 
-    content, error = call_openrouter(system, messages, temperature, max_tokens)
-    if content:
-        return content, None
-    if LLM_PROVIDER == "auto" and GEMINI_API_KEY:
-        return call_gemini(system, messages, temperature, max_tokens)
-    return None, error
+def call_llm(
+    system: str,
+    messages: List[Dict[str, str]],
+    temperature: float = 0.2,
+    max_tokens: int = 900,
+) -> Tuple[Optional[str], Optional[str]]:
+    """Single LLM provider: OpenRouter."""
+    return call_openrouter(system, messages, temperature, max_tokens)
 
 
 # =============================================================================
@@ -811,8 +766,8 @@ if submitted:
     with st.expander("See the exact feature values sent to the models"):
         st.dataframe(X.T.rename(columns={0: "value"}))
 
-    # Automatic descriptive + prescriptive knowledge for manual prediction.
-    if available_provider():
+    # Additive LLM layer: descriptive + prescriptive knowledge from the existing ML result.
+    if OPENROUTER_API_KEY:
         with st.spinner("Generating descriptive and prescriptive knowledge..."):
             insights, ai_error = generate_manager_insights(st.session_state.last_context)
         st.session_state.last_ai_insights = insights
