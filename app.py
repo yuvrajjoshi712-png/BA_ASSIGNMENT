@@ -1,12 +1,14 @@
 """
-Zwigato Delivery Delay Predictor + AI Manager Assistant
----------------------------------------------------------
-IMPORTANT:
-- The existing ML models and feature-engineering/prediction logic are preserved.
-- The LLM is an additional layer on top of the existing application.
-- The top chat box accepts natural/non-technical language, extracts the inputs,
-  and runs the SAME existing models.
-- The existing manual parameter form remains below the chat.
+Zwigato Delivery Delay Predictor + Natural-Language Manager Assistant
+---------------------------------------------------------------------
+The original ML prediction pipeline is preserved. The LLM is an additive layer.
+
+UI:
+1. Natural-language assistant at the TOP: users can describe an order in rough,
+   non-technical language.
+2. The same existing ML model runs after all required inputs are available.
+3. Descriptive + prescriptive knowledge is generated from the model result.
+4. The original manual-parameter prediction form remains BELOW the chat.
 
 Model files expected alongside this script:
     linear_regression_model.joblib
@@ -17,25 +19,21 @@ import datetime as dt
 import json
 import os
 import re
+from typing import Any, Dict, List, Optional, Tuple
 
 import joblib
 import numpy as np
 import pandas as pd
-import streamlit as st
 import requests
+import streamlit as st
 
-st.set_page_config(
-    page_title="Zwigato Delivery Delay Predictor",
-    page_icon="🛵",
-    layout="centered",
-)
+st.set_page_config(page_title="Zwigato Delivery Delay Predictor", page_icon="🛵", layout="centered")
 
-LATE_THRESHOLD = 30  # same business rule used in the existing application
+LATE_THRESHOLD = 30
 
-
-# ----------------------------------------------------------------------------
+# =============================================================================
 # EXISTING MODEL CODE — PRESERVED
-# ----------------------------------------------------------------------------
+# =============================================================================
 @st.cache_resource
 def load_models():
     linear_model = joblib.load("linear_regression_model.joblib")
@@ -69,12 +67,10 @@ def get_time_of_day(hour: int) -> str:
 
 
 def build_feature_row(order: dict) -> pd.DataFrame:
-    """EXISTING feature-engineering logic; intentionally unchanged."""
+    """Original feature-engineering logic, kept unchanged."""
     distance_km = haversine_distance(
-        order["restaurant_lat"],
-        order["restaurant_lon"],
-        order["delivery_lat"],
-        order["delivery_lon"],
+        order["restaurant_lat"], order["restaurant_lon"],
+        order["delivery_lat"], order["delivery_lon"],
     )
 
     order_dt = order["order_datetime"]
@@ -120,7 +116,7 @@ def build_feature_row(order: dict) -> pd.DataFrame:
 
 
 def run_existing_prediction(order: dict):
-    """Run the exact same two model calls used by the original app."""
+    """Same two model calls as the original app."""
     X = build_feature_row(order)
     predicted_minutes = float(linear_model.predict(X)[0])
     late_proba = float(logistic_model.predict_proba(X)[0][1])
@@ -128,7 +124,7 @@ def run_existing_prediction(order: dict):
     return X, predicted_minutes, late_proba, is_late
 
 
-def make_context(order, X, predicted_minutes, late_proba, is_late):
+def make_model_context(order, X, predicted_minutes, late_proba, is_late):
     coefs = pd.Series(logistic_model.coef_[0], index=FEATURE_ORDER)
     contributions = (coefs * X.iloc[0]).sort_values(key=np.abs, ascending=False)
     top = contributions[contributions != 0].head(6)
@@ -167,14 +163,14 @@ def make_context(order, X, predicted_minutes, late_proba, is_late):
             }
             for name, value in top.items()
         ],
-        "note": "These are model associations, not causal proof.",
+        "note": "Model associations are not causal proof.",
     }
 
 
-# ----------------------------------------------------------------------------
-# LLM CONNECTION — ADDITIVE ONLY
-# ----------------------------------------------------------------------------
-def get_secret(name, default=None):
+# =============================================================================
+# LLM LAYER
+# =============================================================================
+def get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
     try:
         value = st.secrets.get(name)
         if value:
@@ -184,89 +180,141 @@ def get_secret(name, default=None):
     return os.getenv(name, default)
 
 
-def clean_secret(value):
-    """Normalize a key copied into Streamlit Secrets."""
+def clean_secret(value: Optional[str]) -> Optional[str]:
     if value is None:
         return None
-    value = str(value).strip()
+    value = str(value).strip().strip("`")
     if value.lower().startswith("bearer "):
         value = value[7:].strip()
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in {'\"', "'"}:
-        value = value[1:-1].strip()
     return value or None
 
 
+# The app supports both providers. If Gemini is configured, it is used first;
+# otherwise OpenRouter is used. Gemini 2.5 Flash-Lite currently has a free tier.
+GEMINI_API_KEY = clean_secret(get_secret("GEMINI_API_KEY"))
+GEMINI_MODEL = get_secret("GEMINI_MODEL", "gemini-2.5-flash-lite")
 OPENROUTER_API_KEY = clean_secret(get_secret("OPENROUTER_API_KEY"))
 OPENROUTER_MODEL = get_secret("OPENROUTER_MODEL", "openrouter/free")
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-OPENROUTER_KEY_URL = "https://openrouter.ai/api/v1/key"
+LLM_PROVIDER = get_secret("LLM_PROVIDER", "auto").lower().strip()
 
 
-def test_openrouter_connection():
-    """Check the same bearer key before attempting a chat completion."""
-    if not OPENROUTER_API_KEY:
-        return False, "OPENROUTER_API_KEY is not configured in Streamlit Secrets."
-    try:
-        r = requests.get(
-            OPENROUTER_KEY_URL,
-            headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"},
-            timeout=20,
-        )
-        if r.ok:
-            return True, "OpenRouter authentication is working."
-        return False, f"OpenRouter authentication failed (HTTP {r.status_code}). {r.text[:800]}"
-    except requests.RequestException as exc:
-        return False, f"Could not reach OpenRouter: {exc}"
+def available_provider() -> Optional[str]:
+    if LLM_PROVIDER == "gemini":
+        return "gemini" if GEMINI_API_KEY else None
+    if LLM_PROVIDER == "openrouter":
+        return "openrouter" if OPENROUTER_API_KEY else None
+    if GEMINI_API_KEY:
+        return "gemini"
+    if OPENROUTER_API_KEY:
+        return "openrouter"
+    return None
 
 
-def call_llm(messages, temperature=0.2, max_tokens=900):
-    if not OPENROUTER_API_KEY:
-        return None, "Add OPENROUTER_API_KEY in Streamlit Secrets."
+def call_gemini(system: str, messages: List[Dict[str, str]], temperature: float, max_tokens: int) -> Tuple[Optional[str], Optional[str]]:
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+    headers = {
+        "x-goog-api-key": GEMINI_API_KEY,
+        "Content-Type": "application/json",
+    }
+
+    contents = []
+    for message in messages:
+        role = message.get("role", "user")
+        if role == "assistant":
+            role = "model"
+        if role == "system":
+            continue
+        contents.append({"role": role, "parts": [{"text": str(message.get("content", ""))}]})
 
     payload = {
-        "model": OPENROUTER_MODEL,
-        "messages": messages,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
+        "systemInstruction": {"parts": [{"text": system}]},
+        "contents": contents,
+        "generationConfig": {
+            "temperature": temperature,
+            "maxOutputTokens": max_tokens,
+        },
     }
+
+    try:
+        response = requests.post(url, headers=headers, json=payload, timeout=45)
+        if not response.ok:
+            try:
+                body = response.json()
+            except ValueError:
+                body = response.text[:1000]
+            return None, f"Gemini HTTP {response.status_code}: {body}"
+        data = response.json()
+        candidates = data.get("candidates", [])
+        if not candidates:
+            return None, "Gemini returned no candidates."
+        parts = candidates[0].get("content", {}).get("parts", [])
+        text_parts = [p.get("text", "") for p in parts if p.get("text")]
+        text = "\n".join(text_parts).strip()
+        return (text, None) if text else (None, "Gemini returned an empty response.")
+    except requests.RequestException as exc:
+        return None, f"Gemini request failed: {exc}"
+    except (ValueError, KeyError, IndexError, TypeError) as exc:
+        return None, f"Could not read Gemini response: {exc}"
+
+
+def call_openrouter(system: str, messages: List[Dict[str, str]], temperature: float, max_tokens: int) -> Tuple[Optional[str], Optional[str]]:
+    url = "https://openrouter.ai/api/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
         "HTTP-Referer": "https://streamlit.io/",
         "X-Title": "Zwigato Delivery Delay Predictor",
     }
+    payload = {
+        "model": OPENROUTER_MODEL,
+        "messages": [{"role": "system", "content": system}] + messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
 
     try:
-        r = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=45)
-        if not r.ok:
+        response = requests.post(url, headers=headers, json=payload, timeout=45)
+        if not response.ok:
             try:
-                body = r.json()
+                body = response.json()
             except ValueError:
-                body = r.text[:1200]
-            return None, f"OpenRouter HTTP {r.status_code}: {body}"
-        data = r.json()
-        content = data.get("choices", [{}])[0].get("message", {}).get("content")
-        if not content:
-            return None, f"OpenRouter returned no assistant content: {data}"
-        return content, None
+                body = response.text[:1000]
+            return None, f"OpenRouter HTTP {response.status_code}: {body}"
+        data = response.json()
+        text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        return (text.strip(), None) if text else (None, "OpenRouter returned an empty response.")
     except requests.RequestException as exc:
-        return None, f"LLM request failed: {exc}"
+        return None, f"OpenRouter request failed: {exc}"
     except (ValueError, KeyError, IndexError, TypeError) as exc:
         return None, f"Could not read OpenRouter response: {exc}"
 
 
-# ----------------------------------------------------------------------------
-# CHAT EXTRACTION
-# ----------------------------------------------------------------------------
-ALLOWED = {
-    "weather": ["Sunny", "Cloudy", "Fog", "Sandstorms", "Stormy", "Windy", "NaN"],
-    "traffic": ["Low", "Medium", "High", "Jam"],
-    "vehicle_type": ["motorcycle ", "scooter ", "electric_scooter ", "bicycle "],
-    "order_type": ["Snack ", "Meal ", "Drinks ", "Buffet "],
-    "festival": ["No", "Yes"],
-    "city": ["Urban", "Metropolitian", "Semi-Urban"],
-}
+def call_llm(system: str, messages: List[Dict[str, str]], temperature: float = 0.2, max_tokens: int = 900) -> Tuple[Optional[str], Optional[str]]:
+    """Call the configured provider. In auto mode, try Gemini then OpenRouter."""
+    provider = available_provider()
+    if not provider:
+        return None, "No LLM API key is configured."
 
+    if provider == "gemini":
+        content, error = call_gemini(system, messages, temperature, max_tokens)
+        if content:
+            return content, None
+        # In auto mode, fall back to OpenRouter if it is also configured.
+        if LLM_PROVIDER == "auto" and OPENROUTER_API_KEY:
+            return call_openrouter(system, messages, temperature, max_tokens)
+        return None, error
+
+    content, error = call_openrouter(system, messages, temperature, max_tokens)
+    if content:
+        return content, None
+    if LLM_PROVIDER == "auto" and GEMINI_API_KEY:
+        return call_gemini(system, messages, temperature, max_tokens)
+    return None, error
+
+
+# =============================================================================
+# NATURAL-LANGUAGE ORDER EXTRACTION
+# =============================================================================
 FIELD_HELP = {
     "order_datetime": "order date and exact time",
     "prep_time": "estimated kitchen preparation time in minutes",
@@ -286,17 +334,15 @@ FIELD_HELP = {
     "city": "city type",
 }
 
-CHAT_EXTRACTOR_SYSTEM = f"""
-You are the input-understanding layer for a Zwigato delivery-delay prediction app.
-The app has an EXISTING machine-learning model. You do not make predictions.
-Your only job is to turn a user's natural-language description into the exact
-input fields needed by that existing model, or ask for missing fields.
+CHAT_SYSTEM = """
+You are the natural-language input layer for the Zwigato delivery-delay prediction app.
+The app already has a trained ML model. You NEVER make the prediction yourself.
+Your job is only to understand the user's language and extract the input parameters.
 
-Return ONLY valid JSON. No markdown. Use this exact structure:
-{{
+Return ONLY valid JSON with this exact structure:
+{
   "intent": "new_prediction" | "follow_up" | "general",
-  "missing_fields": [],
-  "order": {{
+  "order": {
     "order_datetime": "YYYY-MM-DD HH:MM" | null,
     "prep_time": number | null,
     "multiple_deliveries": integer | null,
@@ -313,38 +359,31 @@ Return ONLY valid JSON. No markdown. Use this exact structure:
     "order_type": "Snack " | "Meal " | "Drinks " | "Buffet " | null,
     "festival": "No" | "Yes" | null,
     "city": "Urban" | "Metropolitian" | "Semi-Urban" | null
-  }},
-  "reply": "A concise natural-language response to the user"
-}}
+  },
+  "reply": "brief natural-language response"
+}
 
-Required fields for a NEW prediction:
-{json.dumps(FIELD_HELP, indent=2)}
-
-Natural-language mapping rules:
-- clear/clear sky -> Sunny; storm/stormy -> Stormy; foggy -> Fog; windy -> Windy;
-  cloudy/overcast -> Cloudy; sandstorm -> Sandstorms.
+Mapping rules:
+- clear/clear sky -> Sunny; stormy/storm -> Stormy; fog/foggy -> Fog;
+  windy -> Windy; cloudy/overcast -> Cloudy; sandstorm -> Sandstorms.
 - very low/low traffic -> Low; moderate/medium -> Medium; high -> High;
   jammed/gridlock/traffic jam -> Jam.
-- bike/motorbike -> motorcycle; e-scooter/electric scooter -> electric_scooter;
+- bike/motorbike/motorcycle -> motorcycle; e-scooter/electric scooter -> electric_scooter;
   scooter -> scooter; bicycle/cycle -> bicycle.
-- snack/quick bite -> Snack; meal/lunch/dinner -> Meal; drinks/beverage -> Drinks;
-  buffet -> Buffet.
-- festival yes/no must be explicit or clearly stated.
-- urban/metro/semi-urban map to the listed city categories.
-- Vehicle condition language may be mapped only when clear: poor=0, fair=1,
-  good=2, excellent/best=3.
-- Do NOT invent coordinates. If the user gives a street/city/location name but
-  no coordinates, mark the coordinate fields missing. The current ML model uses
-  restaurant/delivery coordinates directly and also derives Distance_km from them.
-- Do NOT invent date/time. "Evening" without a clock time is missing exact time.
-- Do NOT invent ratings, rider age, prep time, or other numeric values.
-
-A follow-up question about an EXISTING prediction should have intent=follow_up.
-A general question with no prediction context should have intent=general.
-"""
+- snack/quick bite -> Snack; meal/lunch/dinner -> Meal; drink/beverage -> Drinks; buffet -> Buffet.
+- poor vehicle -> 0; fair -> 1; good -> 2; excellent/best -> 3.
+- Explicitly stated festival yes/no only; never assume.
+- Do not invent any numeric value.
+- Do not invent coordinates. The ML model uses the restaurant and delivery coordinates directly.
+- Do not invent date or exact time.
+""".strip()
 
 
-def extract_json_object(text):
+def blank_order() -> Dict[str, Any]:
+    return {key: None for key in FIELD_HELP.keys()}
+
+
+def extract_json(text: str) -> Optional[dict]:
     if not text:
         return None
     match = re.search(r"\{.*\}", text, flags=re.DOTALL)
@@ -356,55 +395,44 @@ def extract_json_object(text):
         return None
 
 
-def blank_order():
-    return {
-        "order_datetime": None,
-        "prep_time": None,
-        "multiple_deliveries": None,
-        "restaurant_lat": None,
-        "restaurant_lon": None,
-        "delivery_lat": None,
-        "delivery_lon": None,
-        "age": None,
-        "ratings": None,
-        "vehicle_condition": None,
-        "weather": None,
-        "traffic": None,
-        "vehicle_type": None,
-        "order_type": None,
-        "festival": None,
-        "city": None,
-    }
-
-
-def merge_orders(old, new):
-    merged = dict(old or blank_order())
-    for key, value in (new or {}).items():
+def merge_orders(old: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, Any]:
+    result = dict(old)
+    for key in result:
+        value = new.get(key) if isinstance(new, dict) else None
         if value is not None and value != "":
-            merged[key] = value
-    return merged
+            result[key] = value
+    return result
 
 
-def normalize_order(parsed_order):
-    order = merge_orders(blank_order(), parsed_order)
-    return order
+def missing_fields(order: Dict[str, Any]) -> List[str]:
+    return [key for key, value in order.items() if value is None or value == ""]
 
 
-def missing_order_fields(order):
-    missing = []
-    for key, value in order.items():
-        if value is None or value == "":
-            missing.append(key)
-    return missing
+def parse_user_order(message: str) -> Tuple[Optional[dict], Optional[str]]:
+    draft = st.session_state.get("chat_draft", blank_order())
+    prompt = (
+        "Current draft from earlier chat messages:\n"
+        + json.dumps(draft, indent=2)
+        + "\n\nNew user message:\n"
+        + message
+        + "\n\nMerge the new information into the current draft and return ONLY JSON."
+    )
+    content, error = call_llm(
+        CHAT_SYSTEM,
+        [{"role": "user", "content": prompt}],
+        temperature=0,
+        max_tokens=1000,
+    )
+    if error:
+        return None, error
+    parsed = extract_json(content)
+    if not parsed:
+        return None, "I could not understand the details clearly. Please describe the order again in simple language."
+    return parsed, None
 
 
-def convert_to_model_order(order):
-    """Convert the chatbot's structured values into the existing app's order dict."""
-    try:
-        order_dt = dt.datetime.strptime(str(order["order_datetime"]), "%Y-%m-%d %H:%M")
-    except Exception as exc:
-        raise ValueError("Order date/time must be in YYYY-MM-DD HH:MM format.") from exc
-
+def convert_chat_order(order: Dict[str, Any]) -> dict:
+    order_dt = dt.datetime.strptime(str(order["order_datetime"]), "%Y-%m-%d %H:%M")
     return {
         "order_datetime": order_dt,
         "prep_time": float(order["prep_time"]),
@@ -425,287 +453,240 @@ def convert_to_model_order(order):
     }
 
 
-def validate_model_order(order):
-    checks = [
-        (0 <= float(order["prep_time"]) <= 60, "Preparation time must be 0-60 minutes."),
-        (0 <= int(order["multiple_deliveries"]) <= 3, "Multiple deliveries must be 0-3."),
-        (15 <= int(order["age"]) <= 50, "Rider age must be 15-50."),
-        (1 <= float(order["ratings"]) <= 6, "Rider rating must be 1-6."),
-        (0 <= int(order["vehicle_condition"]) <= 3, "Vehicle condition must be 0-3."),
-        (order["weather"] in ALLOWED["weather"], "Weather value is not supported."),
-        (order["traffic"] in ALLOWED["traffic"], "Traffic value is not supported."),
-        (order["vehicle_type"] in ALLOWED["vehicle_type"], "Vehicle type is not supported."),
-        (order["order_type"] in ALLOWED["order_type"], "Order type is not supported."),
-        (order["festival"] in ALLOWED["festival"], "Festival value is not supported."),
-        (order["city"] in ALLOWED["city"], "City type is not supported."),
-    ]
-    for ok, message in checks:
-        if not ok:
-            raise ValueError(message)
+def validate_chat_order(order: dict):
+    if not 0 <= order["prep_time"] <= 60:
+        raise ValueError("Kitchen preparation time must be between 0 and 60 minutes.")
+    if not 0 <= order["multiple_deliveries"] <= 3:
+        raise ValueError("Multiple deliveries must be between 0 and 3.")
+    if not 15 <= order["age"] <= 50:
+        raise ValueError("Rider age must be between 15 and 50.")
+    if not 1 <= order["ratings"] <= 6:
+        raise ValueError("Rider rating must be between 1 and 6.")
+    if not 0 <= order["vehicle_condition"] <= 3:
+        raise ValueError("Vehicle condition must be between 0 and 3.")
 
 
-def parse_chat_message(user_message):
-    """Use the LLM to extract structured inputs without making the prediction."""
-    previous = st.session_state.get("chat_order_draft") or blank_order()
-    prompt = (
-        "Existing draft from previous messages:\n"
-        + json.dumps(previous, indent=2, default=str)
-        + "\n\nNew user message:\n"
-        + user_message
-        + "\n\nMerge the new information into the existing draft. Return ONLY JSON."
+def generate_manager_insights(context: dict) -> Tuple[Optional[str], Optional[str]]:
+    system = """
+You are the Zwigato AI Manager Assistant.
+The existing ML model has already made the numerical prediction. Treat the supplied
+prediction and factor direction as authoritative.
+
+Write two clear sections:
+
+### Descriptive knowledge
+Explain what the model predicts, the late-delivery probability, the 30-minute
+business threshold, and the main factors that are associated with higher/lower risk.
+Do not claim causation.
+
+### Prescriptive knowledge
+Provide practical decision-support actions an operations manager could consider.
+Tie each action to the supplied prediction/factors. Mention actions such as reviewing
+the delivery promise, rider assignment, multiple-delivery load, preparation-time
+bottlenecks, routing/traffic exposure, or closer monitoring only where relevant.
+Do not invent real-time information, staffing, capacity, costs, or policies.
+Do not say an action guarantees prevention of delay.
+
+End with exactly: "Decision support, not autopilot."
+""".strip()
+    return call_llm(
+        system,
+        [{"role": "user", "content": "Model context:\n" + json.dumps(context, indent=2)}],
+        temperature=0.15,
+        max_tokens=1000,
     )
 
-    content, error = call_llm(
-        [
-            {"role": "system", "content": CHAT_EXTRACTOR_SYSTEM},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0,
-        max_tokens=900,
+
+def generate_followup(question: str, context: dict, history: List[Dict[str, str]]) -> Tuple[Optional[str], Optional[str]]:
+    system = (
+        "You are the Zwigato AI Manager Assistant answering a question about the CURRENT ML prediction.\n"
+        "Use the provided model context as the source of truth. Explain the result and provide practical "
+        "managerial decision support. Do not change the ML prediction, invent numbers, or claim causation.\n\n"
+        "CURRENT MODEL CONTEXT:\n" + json.dumps(context, indent=2)
     )
-    if error:
-        return None, error
-
-    parsed = extract_json_object(content)
-    if not parsed:
-        return None, "The LLM returned an unreadable structured response. Please try again with more specific details."
-    return parsed, None
+    messages = history[-8:] + [{"role": "user", "content": question}]
+    return call_llm(system, messages, temperature=0.2, max_tokens=800)
 
 
-# ----------------------------------------------------------------------------
-# DESCRIPTIVE + PRESCRIPTIVE KNOWLEDGE
-# ----------------------------------------------------------------------------
-INSIGHT_SYSTEM = """
-You are the AI Manager layer for Zwigato's EXISTING delivery-delay ML model.
-The numerical prediction and factor signs supplied below are authoritative.
-Do not recalculate or change them.
-
-Return exactly two sections:
-## Descriptive knowledge
-Explain what the model predicts, the late probability, threshold, and what the
-supplied top factors indicate. Use simple managerial language. Do not claim
-causation.
-
-## Prescriptive knowledge
-Give practical decision-support actions for an operations manager. Tie each
-action to the supplied prediction/factors. Examples can include reviewing the
-delivery promise, rider allocation, preparation time, multiple-delivery load,
-routing/traffic exposure, and closer monitoring. Do not invent live traffic,
-capacity, policy, cost, or staffing information. Do not claim an action is
-certain to fix the delay.
-
-End with one sentence: "Decision support, not autopilot."
-"""
-
-
-def generate_insights(context):
-    messages = [
-        {"role": "system", "content": INSIGHT_SYSTEM},
-        {
-            "role": "user",
-            "content": "Use this exact model context:\n" + json.dumps(context, indent=2, default=str),
-        },
-    ]
-    return call_llm(messages, temperature=0.15, max_tokens=1000)
-
-
-def generate_follow_up(question, context, history):
-    system = f"""
-You are the Zwigato Manager Assistant answering a follow-up question about the
-CURRENT prediction.
-
-Use the supplied model context as the source of truth. You may explain the
-prediction and provide practical managerial decision support. Do not invent
-numbers or real-time information. Do not change the ML prediction. Do not claim
-causation from association.
-
-Current model context:
-{json.dumps(context, indent=2, default=str)}
-"""
-    messages = [{"role": "system", "content": system}]
-    messages.extend(history[-8:])
-    messages.append({"role": "user", "content": question})
-    return call_llm(messages, temperature=0.2, max_tokens=800)
-
-
-# ----------------------------------------------------------------------------
+# =============================================================================
 # SESSION STATE
-# ----------------------------------------------------------------------------
-for key, default in {
-    "chat_messages": [],
-    "chat_order_draft": blank_order(),
-    "last_prediction_context": None,
-    "last_prediction_source": None,
-    "last_insights": None,
-}.items():
-    if key not in st.session_state:
-        st.session_state[key] = default
+# =============================================================================
+if "chat_messages" not in st.session_state:
+    st.session_state.chat_messages = []
+if "chat_draft" not in st.session_state:
+    st.session_state.chat_draft = blank_order()
+if "last_context" not in st.session_state:
+    st.session_state.last_context = None
+if "last_ai_insights" not in st.session_state:
+    st.session_state.last_ai_insights = None
+if "last_ai_error" not in st.session_state:
+    st.session_state.last_ai_error = None
 
 
-# ----------------------------------------------------------------------------
-# TOP CHATBOT
-# ----------------------------------------------------------------------------
+# =============================================================================
+# TOP NATURAL-LANGUAGE ASSISTANT
+# =============================================================================
 st.title("🛵 Zwigato Delivery Delay Predictor")
 st.caption(
-    "Use the chat for natural-language prediction, or use the full manual form below. "
-    "Both paths use the same existing ML models."
+    "Enter the order manually below or describe it here in your own words. "
+    "Both options use the same existing ML models."
 )
 
 st.subheader("💬 Ask in your own words")
-st.write(
-    "Example: *30-year-old rider, rating 4.8, good vehicle, high traffic, rainy weather...* "
-    "The assistant will collect anything missing before it runs the model."
+st.caption(
+    "Example: *30-year-old rider, rating 4.8, good vehicle, high traffic, rainy weather, "
+    "2 other deliveries...*"
 )
 
-with st.expander("🔧 LLM connection status", expanded=False):
-    if OPENROUTER_API_KEY:
-        st.success("OPENROUTER_API_KEY was detected by the app.")
-        st.caption(f"Model: `{OPENROUTER_MODEL}`")
-        if st.button("Test OpenRouter connection", key="test_openrouter"):
-            ok, message = test_openrouter_connection()
-            (st.success if ok else st.error)(message)
-    else:
-        st.error("OPENROUTER_API_KEY is not detected. Add it in Streamlit → Manage app → Settings → Secrets.")
+# Use text_area + button instead of st.chat_input so the chat box is visibly at the TOP.
+with st.container(border=True):
+    chat_text = st.text_area(
+        "Describe the order",
+        placeholder=(
+            "Example: The rider is 30, has a 4.8 rating, the vehicle is in good condition, "
+            "traffic is high and it is raining..."
+        ),
+        height=100,
+        label_visibility="collapsed",
+    )
+    ask = st.button("Ask Assistant", type="primary", use_container_width=True)
 
-if not OPENROUTER_API_KEY:
-    st.info("Add OPENROUTER_API_KEY in Streamlit Secrets to enable the natural-language chatbot. The manual model remains fully usable.")
-
-# Existing chat history appears above the input box.
-for message in st.session_state.chat_messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
-
-chat_prompt = st.chat_input(
-    "Describe the order in normal language... e.g. 'high traffic, rainy, 4.8 rider rating'"
-)
-
-if chat_prompt:
-    st.session_state.chat_messages.append({"role": "user", "content": chat_prompt})
+if chat_text and ask:
+    st.session_state.chat_messages.append({"role": "user", "content": chat_text})
 
     with st.chat_message("user"):
-        st.markdown(chat_prompt)
+        st.markdown(chat_text)
 
     with st.chat_message("assistant"):
-        with st.spinner("Understanding your order details..."):
-            parsed, error = parse_chat_message(chat_prompt)
+        with st.spinner("Understanding the order details..."):
+            parsed, parse_error = parse_user_order(chat_text)
 
-        if error:
-            answer = error
-            st.error(error)
+        if parse_error:
+            answer = (
+                "I couldn't connect to the AI language service right now. "
+                "Your manual prediction below is unaffected."
+            )
+            st.error(parse_error)
         else:
             intent = parsed.get("intent", "new_prediction")
-            parsed_order = normalize_order(parsed.get("order"))
+            reply = parsed.get("reply", "")
 
-            if intent == "follow_up" and st.session_state.last_prediction_context:
+            if intent == "follow_up" and st.session_state.last_context:
                 history = list(st.session_state.chat_messages[:-1])
-                answer, follow_error = generate_follow_up(
-                    chat_prompt,
-                    st.session_state.last_prediction_context,
-                    history,
+                answer, follow_error = generate_followup(
+                    chat_text, st.session_state.last_context, history
                 )
                 if follow_error:
-                    answer = follow_error
+                    answer = "I couldn't generate the AI response right now."
                     st.error(follow_error)
                 else:
                     st.markdown(answer)
 
-            elif intent == "general" and not any(v is not None for v in parsed_order.values()):
-                answer = parsed.get("reply") or "Please describe an order and I will help turn it into a prediction."
+            elif intent == "general" and st.session_state.last_context is None:
+                answer = reply or "Describe a delivery order and I will help you assess its delay risk."
                 st.markdown(answer)
 
             else:
-                # Continue the order draft across multiple chat messages.
-                st.session_state.chat_order_draft = merge_orders(
-                    st.session_state.chat_order_draft,
-                    parsed_order,
+                st.session_state.chat_draft = merge_orders(
+                    st.session_state.chat_draft,
+                    parsed.get("order", {}) or {},
                 )
-                draft = st.session_state.chat_order_draft
-                missing = missing_order_fields(draft)
+                draft = st.session_state.chat_draft
+                missing = missing_fields(draft)
 
                 if missing:
-                    friendly = parsed.get("reply") or "I have some of the details."
-                    names = [FIELD_HELP.get(x, x) for x in missing]
-                    # Do not dump 16 technical field names unless necessary.
-                    if len(names) <= 4:
-                        request_text = ", ".join(names)
+                    friendly = reply or "I have captured some of the order details."
+                    human_names = [FIELD_HELP[field] for field in missing]
+                    if len(human_names) <= 4:
+                        ask_for = ", ".join(human_names)
                     else:
-                        request_text = "; ".join(names[:4]) + f"; and {len(names)-4} more detail(s)"
-                    answer = (
-                        f"{friendly}\n\n"
-                        f"I still need: **{request_text}**. "
-                        "Please provide those details in your own words."
-                    )
+                        ask_for = ", ".join(human_names[:4]) + f", and {len(human_names) - 4} more"
+                    answer = f"{friendly}\n\nI still need **{ask_for}** before I can run the existing model."
                     st.markdown(answer)
                 else:
                     try:
-                        order = convert_to_model_order(draft)
-                        validate_model_order(order)
+                        order = convert_chat_order(draft)
+                        validate_chat_order(order)
                         X, predicted_minutes, late_proba, is_late = run_existing_prediction(order)
-                        context = make_context(
-                            order, X, predicted_minutes, late_proba, is_late
-                        )
-                        st.session_state.last_prediction_context = context
-                        st.session_state.last_prediction_source = "Chat"
-                        st.session_state.chat_order_draft = blank_order()
+                        context = make_model_context(order, X, predicted_minutes, late_proba, is_late)
+                        st.session_state.last_context = context
+                        st.session_state.chat_draft = blank_order()
 
-                        # Generate descriptive + prescriptive knowledge automatically.
-                        insight_text, insight_error = generate_insights(context)
-
-                        answer = (
-                            f"### Prediction\n"
+                        st.markdown(
                             f"**Predicted delivery time:** {predicted_minutes:.0f} minutes  \n"
                             f"**Late-delivery probability:** {late_proba * 100:.0f}%  \n"
-                            f"**Status:** {'Likely late' if is_late else 'Likely on time'}\n\n"
+                            f"**Status:** {'Likely late' if is_late else 'Likely on time'}"
                         )
 
+                        insights, insight_error = generate_manager_insights(context)
+                        st.session_state.last_ai_insights = insights
+                        st.session_state.last_ai_error = insight_error
                         if insight_error:
-                            answer += (
-                                "The ML prediction is complete. I could not generate the AI descriptive/prescriptive explanation yet. "
-                                f"\n\n`{insight_error}`"
+                            st.info(
+                                "The ML prediction is complete. AI descriptive/prescriptive knowledge "
+                                "could not be generated at the moment."
+                            )
+                            answer = (
+                                f"**Predicted delivery time:** {predicted_minutes:.0f} minutes  \n"
+                                f"**Late-delivery probability:** {late_proba * 100:.0f}%  \n"
+                                f"**Status:** {'Likely late' if is_late else 'Likely on time'}"
                             )
                         else:
-                            answer += insight_text
-
-                        st.markdown(answer)
+                            st.markdown(insights)
+                            answer = (
+                                f"**Predicted delivery time:** {predicted_minutes:.0f} minutes  \n"
+                                f"**Late-delivery probability:** {late_proba * 100:.0f}%  \n"
+                                f"**Status:** {'Likely late' if is_late else 'Likely on time'}\n\n"
+                                + (insights or "")
+                            )
                     except Exception as exc:
-                        answer = f"I understood the inputs, but could not run the existing model: {exc}"
+                        answer = f"I understood the message, but the existing model could not run: {exc}"
                         st.error(answer)
 
         st.session_state.chat_messages.append({"role": "assistant", "content": answer})
 
+# Render previous chat in a compact history area.
+if st.session_state.chat_messages:
+    with st.expander("Conversation history", expanded=False):
+        for msg in st.session_state.chat_messages:
+            st.markdown(f"**{'You' if msg['role'] == 'user' else 'Assistant'}:** {msg['content']}")
+        if st.button("Clear conversation", key="clear_chat"):
+            st.session_state.chat_messages = []
+            st.session_state.chat_draft = blank_order()
+            st.rerun()
 
-# ----------------------------------------------------------------------------
-# LATEST AI OUTPUT ABOVE THE MANUAL MODEL
-# ----------------------------------------------------------------------------
-if st.session_state.last_prediction_context is not None:
-    context = st.session_state.last_prediction_context
-    prediction = context["prediction"]
+
+# =============================================================================
+# LAST AI KNOWLEDGE — visible after a prediction
+# =============================================================================
+if st.session_state.last_context is not None:
+    context = st.session_state.last_context
+    p = context["prediction"]
 
     st.divider()
-    st.subheader("📌 Latest AI-assisted result")
-    st.caption(
-        f"Source: {st.session_state.last_prediction_source or 'Prediction'} · "
-        "The ML prediction is unchanged; the AI adds descriptive and prescriptive knowledge."
-    )
+    st.subheader("🤖 AI Manager Knowledge")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric("Predicted delivery time", f"{p['predicted_delivery_time_minutes']:.0f} min")
+    with c2:
+        st.metric("Late probability", f"{p['late_probability_percent']:.0f}%")
+    with c3:
+        st.metric("Model status", p["classification"])
 
-    a, b, c = st.columns(3)
-    with a:
-        st.metric("Predicted delivery time", f"{prediction['predicted_delivery_time_minutes']:.0f} min")
-    with b:
-        st.metric("Late probability", f"{prediction['late_probability_percent']:.0f}%")
-    with c:
-        st.metric("Model status", prediction["classification"])
+    if st.session_state.last_ai_error:
+        st.info("AI explanation is temporarily unavailable; the ML prediction above is still valid.")
+    elif st.session_state.last_ai_insights:
+        st.markdown(st.session_state.last_ai_insights)
+
+    st.caption("The ML model makes the prediction; the AI layer adds descriptive and prescriptive knowledge.")
 
 
-# ----------------------------------------------------------------------------
-# EXISTING MANUAL MODEL — KEPT BELOW THE CHAT
-# ----------------------------------------------------------------------------
+# =============================================================================
+# EXISTING MANUAL PREDICTION FORM — BELOW THE CHAT
+# =============================================================================
 st.divider()
 st.subheader("🧮 Manual Prediction")
-st.caption(
-    "Prefer entering every parameter yourself? Use the original model interface below. "
-    "This uses the same inputs, feature engineering, and trained models as before."
-)
+st.caption("Use the original parameter-entry interface when you want complete manual control.")
 
 with st.form("order_form"):
     st.subheader("Order details")
@@ -717,15 +698,10 @@ with st.form("order_form"):
     with col2:
         prep_time = st.number_input(
             "Estimated kitchen preparation time (minutes)",
-            min_value=0.0,
-            max_value=60.0,
-            value=15.0,
-            step=1.0,
+            min_value=0.0, max_value=60.0, value=15.0, step=1.0,
             help="Expected time between the order being placed and the rider picking it up.",
         )
-        multiple_deliveries = st.selectbox(
-            "Multiple deliveries on this trip", [0, 1, 2, 3], index=1
-        )
+        multiple_deliveries = st.selectbox("Multiple deliveries on this trip", [0, 1, 2, 3], index=1)
 
     st.subheader("Locations")
     col3, col4 = st.columns(2)
@@ -745,32 +721,18 @@ with st.form("order_form"):
     with col6:
         ratings = st.number_input("Rider rating", min_value=1.0, max_value=6.0, value=4.7, step=0.1)
     with col7:
-        vehicle_condition = st.selectbox(
-            "Vehicle condition (0=poor, 3=best)", [0, 1, 2, 3], index=1
-        )
+        vehicle_condition = st.selectbox("Vehicle condition (0=poor, 3=best)", [0, 1, 2, 3], index=1)
 
     st.subheader("Conditions")
     col8, col9 = st.columns(2)
     with col8:
-        weather = st.selectbox(
-            "Weather",
-            ["Sunny", "Cloudy", "Fog", "Sandstorms", "Stormy", "Windy", "NaN"],
-            index=0,
-        )
-        traffic = st.selectbox(
-            "Road traffic density", ["Low", "Medium", "High", "Jam"], index=1
-        )
-        vehicle_type = st.selectbox(
-            "Vehicle type", ["motorcycle ", "scooter ", "electric_scooter ", "bicycle "], index=0
-        )
+        weather = st.selectbox("Weather", ["Sunny", "Cloudy", "Fog", "Sandstorms", "Stormy", "Windy", "NaN"], index=0)
+        traffic = st.selectbox("Road traffic density", ["Low", "Medium", "High", "Jam"], index=1)
+        vehicle_type = st.selectbox("Vehicle type", ["motorcycle ", "scooter ", "electric_scooter ", "bicycle "], index=0)
     with col9:
-        order_type = st.selectbox(
-            "Type of order", ["Snack ", "Meal ", "Drinks ", "Buffet "], index=0
-        )
+        order_type = st.selectbox("Type of order", ["Snack ", "Meal ", "Drinks ", "Buffet "], index=0)
         festival = st.selectbox("Festival day", ["No", "Yes"], index=0)
-        city = st.selectbox(
-            "City type", ["Urban", "Metropolitian", "Semi-Urban"], index=1
-        )
+        city = st.selectbox("City type", ["Urban", "Metropolitian", "Semi-Urban"], index=1)
 
     submitted = st.form_submit_button("Predict delivery outcome")
 
@@ -794,15 +756,14 @@ if submitted:
         "city": city,
     }
 
-    # SAME prediction logic as original application.
-    X, predicted_minutes, late_proba, is_late = run_existing_prediction(order)
+    X = build_feature_row(order)
+    predicted_minutes = float(linear_model.predict(X)[0])
+    late_proba = float(logistic_model.predict_proba(X)[0][1])
+    is_late = late_proba >= 0.5
 
-    # Store latest prediction so the top chat can answer follow-up questions
-    # about the manually created prediction.
-    st.session_state.last_prediction_context = make_context(
+    st.session_state.last_context = make_model_context(
         order, X, predicted_minutes, late_proba, is_late
     )
-    st.session_state.last_prediction_source = "Manual form"
 
     st.divider()
     st.subheader("Prediction")
@@ -835,15 +796,10 @@ if submitted:
     top_contributions = contributions[contributions != 0].head(6)
 
     if len(top_contributions) > 0:
-        explain_df = pd.DataFrame(
-            {
-                "Factor": top_contributions.index,
-                "Effect on late risk": [
-                    "Increases risk" if v > 0 else "Decreases risk"
-                    for v in top_contributions
-                ],
-            }
-        )
+        explain_df = pd.DataFrame({
+            "Factor": top_contributions.index,
+            "Effect on late risk": ["Increases risk" if v > 0 else "Decreases risk" for v in top_contributions],
+        })
         st.table(explain_df)
         st.caption(
             "Factors are the active inputs for this order with the largest effect, "
@@ -855,18 +811,25 @@ if submitted:
     with st.expander("See the exact feature values sent to the models"):
         st.dataframe(X.T.rename(columns={0: "value"}))
 
-    if OPENROUTER_API_KEY:
+    # Automatic descriptive + prescriptive knowledge for manual prediction.
+    if available_provider():
         with st.spinner("Generating descriptive and prescriptive knowledge..."):
-            insight_text, insight_error = generate_insights(
-                st.session_state.last_prediction_context
-            )
-        st.subheader("🤖 AI Manager Insights")
-        if insight_error:
-            st.warning(insight_error)
+            insights, ai_error = generate_manager_insights(st.session_state.last_context)
+        st.session_state.last_ai_insights = insights
+        st.session_state.last_ai_error = ai_error
+        st.divider()
+        st.subheader("🤖 AI Manager Knowledge")
+        if ai_error:
+            st.info("The ML prediction is complete, but the AI explanation could not be generated right now.")
         else:
-            st.markdown(insight_text)
+            st.markdown(insights)
     else:
-        st.info("Add OPENROUTER_API_KEY in Streamlit Secrets to get descriptive and prescriptive AI knowledge for manual predictions.")
+        st.divider()
+        st.subheader("🤖 AI Manager Knowledge")
+        st.info(
+            "The ML prediction is complete. Add an LLM API key in Streamlit Secrets "
+            "to generate descriptive and prescriptive knowledge."
+        )
 
 st.divider()
 st.caption(
