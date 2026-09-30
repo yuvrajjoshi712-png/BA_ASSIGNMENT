@@ -1,12 +1,12 @@
 """
-Zwigato Delivery Delay Predictor
---------------------------------
-Streamlit app for Business Analytics Assignment 2 (predictive analytics &
-managerial AI adoption). Loads the linear regression (delivery time, minutes)
-and logistic regression (probability of being late, >30 min) models trained
-in the accompanying Colab notebook, and reproduces that notebook's exact
-feature-engineering pipeline so a live order's inputs line up with the
-columns each model was trained on.
+Zwigato Delivery Delay Predictor + AI Manager Assistant
+---------------------------------------------------------
+IMPORTANT:
+- The existing ML models and feature-engineering/prediction logic are preserved.
+- The LLM is an additional layer on top of the existing application.
+- The top chat box accepts natural/non-technical language, extracts the inputs,
+  and runs the SAME existing models.
+- The existing manual parameter form remains below the chat.
 
 Model files expected alongside this script:
     linear_regression_model.joblib
@@ -14,19 +14,27 @@ Model files expected alongside this script:
 """
 
 import datetime as dt
+import json
+import os
+import re
 
 import joblib
 import numpy as np
 import pandas as pd
 import streamlit as st
+import requests
 
-st.set_page_config(page_title="Zwigato Delivery Delay Predictor", page_icon="🛵", layout="centered")
+st.set_page_config(
+    page_title="Zwigato Delivery Delay Predictor",
+    page_icon="🛵",
+    layout="centered",
+)
 
-LATE_THRESHOLD = 30  # minutes — same business rule used to train the logistic model
+LATE_THRESHOLD = 30  # same business rule used in the existing application
 
 
 # ----------------------------------------------------------------------------
-# Load models
+# EXISTING MODEL CODE — PRESERVED
 # ----------------------------------------------------------------------------
 @st.cache_resource
 def load_models():
@@ -36,15 +44,11 @@ def load_models():
 
 
 linear_model, logistic_model = load_models()
-FEATURE_ORDER = list(linear_model.feature_names_in_)  # identical for both models
+FEATURE_ORDER = list(linear_model.feature_names_in_)
 
 
-# ----------------------------------------------------------------------------
-# Feature engineering — mirrors the notebook's clean_data / feature_engineering /
-# pd.get_dummies(drop_first=True) pipeline exactly, for a single order.
-# ----------------------------------------------------------------------------
 def haversine_distance(lat1, lon1, lat2, lon2):
-    R = 6371  # Earth radius, km
+    R = 6371
     lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
     dlon = lon2 - lon1
     dlat = lat2 - lat1
@@ -65,15 +69,16 @@ def get_time_of_day(hour: int) -> str:
 
 
 def build_feature_row(order: dict) -> pd.DataFrame:
-    """Turn one order's raw inputs into the one-hot-encoded row the models expect."""
-
+    """EXISTING feature-engineering logic; intentionally unchanged."""
     distance_km = haversine_distance(
-        order["restaurant_lat"], order["restaurant_lon"],
-        order["delivery_lat"], order["delivery_lon"],
+        order["restaurant_lat"],
+        order["restaurant_lon"],
+        order["delivery_lat"],
+        order["delivery_lon"],
     )
 
     order_dt = order["order_datetime"]
-    day_of_week = order_dt.weekday()  # Monday=0 .. Sunday=6, matches Order_Date.dt.dayofweek
+    day_of_week = order_dt.weekday()
     month = order_dt.month
     hour = order_dt.hour
     time_of_day = get_time_of_day(hour)
@@ -91,24 +96,17 @@ def build_feature_row(order: dict) -> pd.DataFrame:
         "Distance_km": distance_km,
     }
 
-    # One-hot blocks — category names and the dropped (reference) category in each
-    # match pd.get_dummies(..., drop_first=True) exactly as run in the notebook.
-    # Missing-value tokens ("NaN "/"conditions NaN") became the literal category
-    # "NaN" (Weatherconditions) or "None" (Festival, City, Road_traffic_density)
-    # in the training data, and those are included as selectable options below
-    # so the app can reproduce an order with missing information if needed.
-
     one_hot_blocks = {
-        "Weatherconditions": (order["weather"], ["Fog", "NaN", "Sandstorms", "Stormy", "Sunny", "Windy"]),  # ref: Cloudy
-        "Road_traffic_density": (order["traffic"], ["Jam", "Low", "Medium"]),  # ref: High (None never appears in this data)
-        "Type_of_order": (order["order_type"], ["Drinks ", "Meal ", "Snack "]),  # ref: Buffet
-        "Type_of_vehicle": (order["vehicle_type"], ["motorcycle ", "scooter "]),  # ref: bicycle / electric_scooter
-        "Festival": (order["festival"], ["Yes"]),  # ref: No (None never appears in this data)
-        "City": (order["city"], ["Semi-Urban", "Urban"]),  # ref: Metropolitian (None never appears in this data)
-        "Time_of_Day": (time_of_day, ["Evening", "Morning", "Night"]),  # ref: Afternoon
-        "Order_DayOfWeek": (day_of_week, [1, 2, 3, 4, 5, 6]),  # ref: 0 (Monday)
-        "Order_Month": (month, [3, 4]),  # ref: any other month (only Mar/Apr seen in training data)
-        "Order_Hour": (hour, [8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]),  # ref: 0-7
+        "Weatherconditions": (order["weather"], ["Fog", "NaN", "Sandstorms", "Stormy", "Sunny", "Windy"]),
+        "Road_traffic_density": (order["traffic"], ["Jam", "Low", "Medium"]),
+        "Type_of_order": (order["order_type"], ["Drinks ", "Meal ", "Snack "]),
+        "Type_of_vehicle": (order["vehicle_type"], ["motorcycle ", "scooter "]),
+        "Festival": (order["festival"], ["Yes"]),
+        "City": (order["city"], ["Semi-Urban", "Urban"]),
+        "Time_of_Day": (time_of_day, ["Evening", "Morning", "Night"]),
+        "Order_DayOfWeek": (day_of_week, [1, 2, 3, 4, 5, 6]),
+        "Order_Month": (month, [3, 4]),
+        "Order_Hour": (hour, [8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]),
     }
 
     for prefix, (value, categories) in one_hot_blocks.items():
@@ -117,20 +115,596 @@ def build_feature_row(order: dict) -> pd.DataFrame:
             row[col] = 1 if value == cat else 0
 
     df_row = pd.DataFrame([row])
-    # Reindex to the exact column order/set the models were trained on;
-    # any column not explicitly set above (there shouldn't be any) is filled 0.
     df_row = df_row.reindex(columns=FEATURE_ORDER, fill_value=0)
     return df_row
 
 
+def run_existing_prediction(order: dict):
+    """Run the exact same two model calls used by the original app."""
+    X = build_feature_row(order)
+    predicted_minutes = float(linear_model.predict(X)[0])
+    late_proba = float(logistic_model.predict_proba(X)[0][1])
+    is_late = late_proba >= 0.5
+    return X, predicted_minutes, late_proba, is_late
+
+
+def make_context(order, X, predicted_minutes, late_proba, is_late):
+    coefs = pd.Series(logistic_model.coef_[0], index=FEATURE_ORDER)
+    contributions = (coefs * X.iloc[0]).sort_values(key=np.abs, ascending=False)
+    top = contributions[contributions != 0].head(6)
+
+    return {
+        "prediction": {
+            "predicted_delivery_time_minutes": round(predicted_minutes, 2),
+            "late_probability_percent": round(late_proba * 100, 2),
+            "late_threshold_minutes": LATE_THRESHOLD,
+            "classification": "LIKELY LATE" if is_late else "LIKELY ON TIME",
+        },
+        "order": {
+            "order_date": str(order["order_datetime"].date()),
+            "order_time": str(order["order_datetime"].strftime("%H:%M")),
+            "kitchen_preparation_time_minutes": float(order["prep_time"]),
+            "multiple_deliveries": int(order["multiple_deliveries"]),
+            "restaurant_latitude": float(order["restaurant_lat"]),
+            "restaurant_longitude": float(order["restaurant_lon"]),
+            "delivery_latitude": float(order["delivery_lat"]),
+            "delivery_longitude": float(order["delivery_lon"]),
+            "rider_age": int(order["age"]),
+            "rider_rating": float(order["ratings"]),
+            "vehicle_condition": int(order["vehicle_condition"]),
+            "weather": str(order["weather"]).strip(),
+            "traffic": str(order["traffic"]).strip(),
+            "vehicle_type": str(order["vehicle_type"]).strip(),
+            "order_type": str(order["order_type"]).strip(),
+            "festival": str(order["festival"]).strip(),
+            "city": str(order["city"]).strip(),
+        },
+        "model_drivers": [
+            {
+                "factor": str(name),
+                "effect": "Increases late risk" if value > 0 else "Decreases late risk",
+                "contribution_score": round(float(value), 6),
+            }
+            for name, value in top.items()
+        ],
+        "note": "These are model associations, not causal proof.",
+    }
+
+
 # ----------------------------------------------------------------------------
-# UI
+# LLM CONNECTION — ADDITIVE ONLY
+# ----------------------------------------------------------------------------
+def get_secret(name, default=None):
+    try:
+        value = st.secrets.get(name)
+        if value:
+            return str(value)
+    except Exception:
+        pass
+    return os.getenv(name, default)
+
+
+def clean_secret(value):
+    """Normalize a key copied into Streamlit Secrets."""
+    if value is None:
+        return None
+    value = str(value).strip()
+    if value.lower().startswith("bearer "):
+        value = value[7:].strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {'\"', "'"}:
+        value = value[1:-1].strip()
+    return value or None
+
+
+OPENROUTER_API_KEY = clean_secret(get_secret("OPENROUTER_API_KEY"))
+OPENROUTER_MODEL = get_secret("OPENROUTER_MODEL", "openrouter/free")
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_KEY_URL = "https://openrouter.ai/api/v1/key"
+
+
+def test_openrouter_connection():
+    """Check the same bearer key before attempting a chat completion."""
+    if not OPENROUTER_API_KEY:
+        return False, "OPENROUTER_API_KEY is not configured in Streamlit Secrets."
+    try:
+        r = requests.get(
+            OPENROUTER_KEY_URL,
+            headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"},
+            timeout=20,
+        )
+        if r.ok:
+            return True, "OpenRouter authentication is working."
+        return False, f"OpenRouter authentication failed (HTTP {r.status_code}). {r.text[:800]}"
+    except requests.RequestException as exc:
+        return False, f"Could not reach OpenRouter: {exc}"
+
+
+def call_llm(messages, temperature=0.2, max_tokens=900):
+    if not OPENROUTER_API_KEY:
+        return None, "Add OPENROUTER_API_KEY in Streamlit Secrets."
+
+    payload = {
+        "model": OPENROUTER_MODEL,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://streamlit.io/",
+        "X-Title": "Zwigato Delivery Delay Predictor",
+    }
+
+    try:
+        r = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=45)
+        if not r.ok:
+            try:
+                body = r.json()
+            except ValueError:
+                body = r.text[:1200]
+            return None, f"OpenRouter HTTP {r.status_code}: {body}"
+        data = r.json()
+        content = data.get("choices", [{}])[0].get("message", {}).get("content")
+        if not content:
+            return None, f"OpenRouter returned no assistant content: {data}"
+        return content, None
+    except requests.RequestException as exc:
+        return None, f"LLM request failed: {exc}"
+    except (ValueError, KeyError, IndexError, TypeError) as exc:
+        return None, f"Could not read OpenRouter response: {exc}"
+
+
+# ----------------------------------------------------------------------------
+# CHAT EXTRACTION
+# ----------------------------------------------------------------------------
+ALLOWED = {
+    "weather": ["Sunny", "Cloudy", "Fog", "Sandstorms", "Stormy", "Windy", "NaN"],
+    "traffic": ["Low", "Medium", "High", "Jam"],
+    "vehicle_type": ["motorcycle ", "scooter ", "electric_scooter ", "bicycle "],
+    "order_type": ["Snack ", "Meal ", "Drinks ", "Buffet "],
+    "festival": ["No", "Yes"],
+    "city": ["Urban", "Metropolitian", "Semi-Urban"],
+}
+
+FIELD_HELP = {
+    "order_datetime": "order date and exact time",
+    "prep_time": "estimated kitchen preparation time in minutes",
+    "multiple_deliveries": "number of deliveries on this trip (0-3)",
+    "restaurant_lat": "restaurant latitude",
+    "restaurant_lon": "restaurant longitude",
+    "delivery_lat": "delivery-location latitude",
+    "delivery_lon": "delivery-location longitude",
+    "age": "rider age",
+    "ratings": "rider rating",
+    "vehicle_condition": "vehicle condition from 0 to 3",
+    "weather": "weather",
+    "traffic": "road traffic density",
+    "vehicle_type": "vehicle type",
+    "order_type": "order type",
+    "festival": "whether it is a festival day",
+    "city": "city type",
+}
+
+CHAT_EXTRACTOR_SYSTEM = f"""
+You are the input-understanding layer for a Zwigato delivery-delay prediction app.
+The app has an EXISTING machine-learning model. You do not make predictions.
+Your only job is to turn a user's natural-language description into the exact
+input fields needed by that existing model, or ask for missing fields.
+
+Return ONLY valid JSON. No markdown. Use this exact structure:
+{{
+  "intent": "new_prediction" | "follow_up" | "general",
+  "missing_fields": [],
+  "order": {{
+    "order_datetime": "YYYY-MM-DD HH:MM" | null,
+    "prep_time": number | null,
+    "multiple_deliveries": integer | null,
+    "restaurant_lat": number | null,
+    "restaurant_lon": number | null,
+    "delivery_lat": number | null,
+    "delivery_lon": number | null,
+    "age": number | null,
+    "ratings": number | null,
+    "vehicle_condition": integer | null,
+    "weather": "Sunny" | "Cloudy" | "Fog" | "Sandstorms" | "Stormy" | "Windy" | "NaN" | null,
+    "traffic": "Low" | "Medium" | "High" | "Jam" | null,
+    "vehicle_type": "motorcycle " | "scooter " | "electric_scooter " | "bicycle " | null,
+    "order_type": "Snack " | "Meal " | "Drinks " | "Buffet " | null,
+    "festival": "No" | "Yes" | null,
+    "city": "Urban" | "Metropolitian" | "Semi-Urban" | null
+  }},
+  "reply": "A concise natural-language response to the user"
+}}
+
+Required fields for a NEW prediction:
+{json.dumps(FIELD_HELP, indent=2)}
+
+Natural-language mapping rules:
+- clear/clear sky -> Sunny; storm/stormy -> Stormy; foggy -> Fog; windy -> Windy;
+  cloudy/overcast -> Cloudy; sandstorm -> Sandstorms.
+- very low/low traffic -> Low; moderate/medium -> Medium; high -> High;
+  jammed/gridlock/traffic jam -> Jam.
+- bike/motorbike -> motorcycle; e-scooter/electric scooter -> electric_scooter;
+  scooter -> scooter; bicycle/cycle -> bicycle.
+- snack/quick bite -> Snack; meal/lunch/dinner -> Meal; drinks/beverage -> Drinks;
+  buffet -> Buffet.
+- festival yes/no must be explicit or clearly stated.
+- urban/metro/semi-urban map to the listed city categories.
+- Vehicle condition language may be mapped only when clear: poor=0, fair=1,
+  good=2, excellent/best=3.
+- Do NOT invent coordinates. If the user gives a street/city/location name but
+  no coordinates, mark the coordinate fields missing. The current ML model uses
+  restaurant/delivery coordinates directly and also derives Distance_km from them.
+- Do NOT invent date/time. "Evening" without a clock time is missing exact time.
+- Do NOT invent ratings, rider age, prep time, or other numeric values.
+
+A follow-up question about an EXISTING prediction should have intent=follow_up.
+A general question with no prediction context should have intent=general.
+"""
+
+
+def extract_json_object(text):
+    if not text:
+        return None
+    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    if not match:
+        return None
+    try:
+        return json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return None
+
+
+def blank_order():
+    return {
+        "order_datetime": None,
+        "prep_time": None,
+        "multiple_deliveries": None,
+        "restaurant_lat": None,
+        "restaurant_lon": None,
+        "delivery_lat": None,
+        "delivery_lon": None,
+        "age": None,
+        "ratings": None,
+        "vehicle_condition": None,
+        "weather": None,
+        "traffic": None,
+        "vehicle_type": None,
+        "order_type": None,
+        "festival": None,
+        "city": None,
+    }
+
+
+def merge_orders(old, new):
+    merged = dict(old or blank_order())
+    for key, value in (new or {}).items():
+        if value is not None and value != "":
+            merged[key] = value
+    return merged
+
+
+def normalize_order(parsed_order):
+    order = merge_orders(blank_order(), parsed_order)
+    return order
+
+
+def missing_order_fields(order):
+    missing = []
+    for key, value in order.items():
+        if value is None or value == "":
+            missing.append(key)
+    return missing
+
+
+def convert_to_model_order(order):
+    """Convert the chatbot's structured values into the existing app's order dict."""
+    try:
+        order_dt = dt.datetime.strptime(str(order["order_datetime"]), "%Y-%m-%d %H:%M")
+    except Exception as exc:
+        raise ValueError("Order date/time must be in YYYY-MM-DD HH:MM format.") from exc
+
+    return {
+        "order_datetime": order_dt,
+        "prep_time": float(order["prep_time"]),
+        "multiple_deliveries": int(order["multiple_deliveries"]),
+        "restaurant_lat": float(order["restaurant_lat"]),
+        "restaurant_lon": float(order["restaurant_lon"]),
+        "delivery_lat": float(order["delivery_lat"]),
+        "delivery_lon": float(order["delivery_lon"]),
+        "age": int(float(order["age"])),
+        "ratings": float(order["ratings"]),
+        "vehicle_condition": int(order["vehicle_condition"]),
+        "weather": str(order["weather"]),
+        "traffic": str(order["traffic"]),
+        "vehicle_type": str(order["vehicle_type"]),
+        "order_type": str(order["order_type"]),
+        "festival": str(order["festival"]),
+        "city": str(order["city"]),
+    }
+
+
+def validate_model_order(order):
+    checks = [
+        (0 <= float(order["prep_time"]) <= 60, "Preparation time must be 0-60 minutes."),
+        (0 <= int(order["multiple_deliveries"]) <= 3, "Multiple deliveries must be 0-3."),
+        (15 <= int(order["age"]) <= 50, "Rider age must be 15-50."),
+        (1 <= float(order["ratings"]) <= 6, "Rider rating must be 1-6."),
+        (0 <= int(order["vehicle_condition"]) <= 3, "Vehicle condition must be 0-3."),
+        (order["weather"] in ALLOWED["weather"], "Weather value is not supported."),
+        (order["traffic"] in ALLOWED["traffic"], "Traffic value is not supported."),
+        (order["vehicle_type"] in ALLOWED["vehicle_type"], "Vehicle type is not supported."),
+        (order["order_type"] in ALLOWED["order_type"], "Order type is not supported."),
+        (order["festival"] in ALLOWED["festival"], "Festival value is not supported."),
+        (order["city"] in ALLOWED["city"], "City type is not supported."),
+    ]
+    for ok, message in checks:
+        if not ok:
+            raise ValueError(message)
+
+
+def parse_chat_message(user_message):
+    """Use the LLM to extract structured inputs without making the prediction."""
+    previous = st.session_state.get("chat_order_draft") or blank_order()
+    prompt = (
+        "Existing draft from previous messages:\n"
+        + json.dumps(previous, indent=2, default=str)
+        + "\n\nNew user message:\n"
+        + user_message
+        + "\n\nMerge the new information into the existing draft. Return ONLY JSON."
+    )
+
+    content, error = call_llm(
+        [
+            {"role": "system", "content": CHAT_EXTRACTOR_SYSTEM},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0,
+        max_tokens=900,
+    )
+    if error:
+        return None, error
+
+    parsed = extract_json_object(content)
+    if not parsed:
+        return None, "The LLM returned an unreadable structured response. Please try again with more specific details."
+    return parsed, None
+
+
+# ----------------------------------------------------------------------------
+# DESCRIPTIVE + PRESCRIPTIVE KNOWLEDGE
+# ----------------------------------------------------------------------------
+INSIGHT_SYSTEM = """
+You are the AI Manager layer for Zwigato's EXISTING delivery-delay ML model.
+The numerical prediction and factor signs supplied below are authoritative.
+Do not recalculate or change them.
+
+Return exactly two sections:
+## Descriptive knowledge
+Explain what the model predicts, the late probability, threshold, and what the
+supplied top factors indicate. Use simple managerial language. Do not claim
+causation.
+
+## Prescriptive knowledge
+Give practical decision-support actions for an operations manager. Tie each
+action to the supplied prediction/factors. Examples can include reviewing the
+delivery promise, rider allocation, preparation time, multiple-delivery load,
+routing/traffic exposure, and closer monitoring. Do not invent live traffic,
+capacity, policy, cost, or staffing information. Do not claim an action is
+certain to fix the delay.
+
+End with one sentence: "Decision support, not autopilot."
+"""
+
+
+def generate_insights(context):
+    messages = [
+        {"role": "system", "content": INSIGHT_SYSTEM},
+        {
+            "role": "user",
+            "content": "Use this exact model context:\n" + json.dumps(context, indent=2, default=str),
+        },
+    ]
+    return call_llm(messages, temperature=0.15, max_tokens=1000)
+
+
+def generate_follow_up(question, context, history):
+    system = f"""
+You are the Zwigato Manager Assistant answering a follow-up question about the
+CURRENT prediction.
+
+Use the supplied model context as the source of truth. You may explain the
+prediction and provide practical managerial decision support. Do not invent
+numbers or real-time information. Do not change the ML prediction. Do not claim
+causation from association.
+
+Current model context:
+{json.dumps(context, indent=2, default=str)}
+"""
+    messages = [{"role": "system", "content": system}]
+    messages.extend(history[-8:])
+    messages.append({"role": "user", "content": question})
+    return call_llm(messages, temperature=0.2, max_tokens=800)
+
+
+# ----------------------------------------------------------------------------
+# SESSION STATE
+# ----------------------------------------------------------------------------
+for key, default in {
+    "chat_messages": [],
+    "chat_order_draft": blank_order(),
+    "last_prediction_context": None,
+    "last_prediction_source": None,
+    "last_insights": None,
+}.items():
+    if key not in st.session_state:
+        st.session_state[key] = default
+
+
+# ----------------------------------------------------------------------------
+# TOP CHATBOT
 # ----------------------------------------------------------------------------
 st.title("🛵 Zwigato Delivery Delay Predictor")
 st.caption(
-    "Predicts expected delivery time and the probability an order will be late "
-    f"(later than {LATE_THRESHOLD} minutes), to help operations managers set "
-    "delivery promises and flag orders needing attention."
+    "Use the chat for natural-language prediction, or use the full manual form below. "
+    "Both paths use the same existing ML models."
+)
+
+st.subheader("💬 Ask in your own words")
+st.write(
+    "Example: *30-year-old rider, rating 4.8, good vehicle, high traffic, rainy weather...* "
+    "The assistant will collect anything missing before it runs the model."
+)
+
+with st.expander("🔧 LLM connection status", expanded=False):
+    if OPENROUTER_API_KEY:
+        st.success("OPENROUTER_API_KEY was detected by the app.")
+        st.caption(f"Model: `{OPENROUTER_MODEL}`")
+        if st.button("Test OpenRouter connection", key="test_openrouter"):
+            ok, message = test_openrouter_connection()
+            (st.success if ok else st.error)(message)
+    else:
+        st.error("OPENROUTER_API_KEY is not detected. Add it in Streamlit → Manage app → Settings → Secrets.")
+
+if not OPENROUTER_API_KEY:
+    st.info("Add OPENROUTER_API_KEY in Streamlit Secrets to enable the natural-language chatbot. The manual model remains fully usable.")
+
+# Existing chat history appears above the input box.
+for message in st.session_state.chat_messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+
+chat_prompt = st.chat_input(
+    "Describe the order in normal language... e.g. 'high traffic, rainy, 4.8 rider rating'"
+)
+
+if chat_prompt:
+    st.session_state.chat_messages.append({"role": "user", "content": chat_prompt})
+
+    with st.chat_message("user"):
+        st.markdown(chat_prompt)
+
+    with st.chat_message("assistant"):
+        with st.spinner("Understanding your order details..."):
+            parsed, error = parse_chat_message(chat_prompt)
+
+        if error:
+            answer = error
+            st.error(error)
+        else:
+            intent = parsed.get("intent", "new_prediction")
+            parsed_order = normalize_order(parsed.get("order"))
+
+            if intent == "follow_up" and st.session_state.last_prediction_context:
+                history = list(st.session_state.chat_messages[:-1])
+                answer, follow_error = generate_follow_up(
+                    chat_prompt,
+                    st.session_state.last_prediction_context,
+                    history,
+                )
+                if follow_error:
+                    answer = follow_error
+                    st.error(follow_error)
+                else:
+                    st.markdown(answer)
+
+            elif intent == "general" and not any(v is not None for v in parsed_order.values()):
+                answer = parsed.get("reply") or "Please describe an order and I will help turn it into a prediction."
+                st.markdown(answer)
+
+            else:
+                # Continue the order draft across multiple chat messages.
+                st.session_state.chat_order_draft = merge_orders(
+                    st.session_state.chat_order_draft,
+                    parsed_order,
+                )
+                draft = st.session_state.chat_order_draft
+                missing = missing_order_fields(draft)
+
+                if missing:
+                    friendly = parsed.get("reply") or "I have some of the details."
+                    names = [FIELD_HELP.get(x, x) for x in missing]
+                    # Do not dump 16 technical field names unless necessary.
+                    if len(names) <= 4:
+                        request_text = ", ".join(names)
+                    else:
+                        request_text = "; ".join(names[:4]) + f"; and {len(names)-4} more detail(s)"
+                    answer = (
+                        f"{friendly}\n\n"
+                        f"I still need: **{request_text}**. "
+                        "Please provide those details in your own words."
+                    )
+                    st.markdown(answer)
+                else:
+                    try:
+                        order = convert_to_model_order(draft)
+                        validate_model_order(order)
+                        X, predicted_minutes, late_proba, is_late = run_existing_prediction(order)
+                        context = make_context(
+                            order, X, predicted_minutes, late_proba, is_late
+                        )
+                        st.session_state.last_prediction_context = context
+                        st.session_state.last_prediction_source = "Chat"
+                        st.session_state.chat_order_draft = blank_order()
+
+                        # Generate descriptive + prescriptive knowledge automatically.
+                        insight_text, insight_error = generate_insights(context)
+
+                        answer = (
+                            f"### Prediction\n"
+                            f"**Predicted delivery time:** {predicted_minutes:.0f} minutes  \n"
+                            f"**Late-delivery probability:** {late_proba * 100:.0f}%  \n"
+                            f"**Status:** {'Likely late' if is_late else 'Likely on time'}\n\n"
+                        )
+
+                        if insight_error:
+                            answer += (
+                                "The ML prediction is complete. I could not generate the AI descriptive/prescriptive explanation yet. "
+                                f"\n\n`{insight_error}`"
+                            )
+                        else:
+                            answer += insight_text
+
+                        st.markdown(answer)
+                    except Exception as exc:
+                        answer = f"I understood the inputs, but could not run the existing model: {exc}"
+                        st.error(answer)
+
+        st.session_state.chat_messages.append({"role": "assistant", "content": answer})
+
+
+# ----------------------------------------------------------------------------
+# LATEST AI OUTPUT ABOVE THE MANUAL MODEL
+# ----------------------------------------------------------------------------
+if st.session_state.last_prediction_context is not None:
+    context = st.session_state.last_prediction_context
+    prediction = context["prediction"]
+
+    st.divider()
+    st.subheader("📌 Latest AI-assisted result")
+    st.caption(
+        f"Source: {st.session_state.last_prediction_source or 'Prediction'} · "
+        "The ML prediction is unchanged; the AI adds descriptive and prescriptive knowledge."
+    )
+
+    a, b, c = st.columns(3)
+    with a:
+        st.metric("Predicted delivery time", f"{prediction['predicted_delivery_time_minutes']:.0f} min")
+    with b:
+        st.metric("Late probability", f"{prediction['late_probability_percent']:.0f}%")
+    with c:
+        st.metric("Model status", prediction["classification"])
+
+
+# ----------------------------------------------------------------------------
+# EXISTING MANUAL MODEL — KEPT BELOW THE CHAT
+# ----------------------------------------------------------------------------
+st.divider()
+st.subheader("🧮 Manual Prediction")
+st.caption(
+    "Prefer entering every parameter yourself? Use the original model interface below. "
+    "This uses the same inputs, feature engineering, and trained models as before."
 )
 
 with st.form("order_form"):
@@ -143,10 +717,15 @@ with st.form("order_form"):
     with col2:
         prep_time = st.number_input(
             "Estimated kitchen preparation time (minutes)",
-            min_value=0.0, max_value=60.0, value=15.0, step=1.0,
+            min_value=0.0,
+            max_value=60.0,
+            value=15.0,
+            step=1.0,
             help="Expected time between the order being placed and the rider picking it up.",
         )
-        multiple_deliveries = st.selectbox("Multiple deliveries on this trip", [0, 1, 2, 3], index=1)
+        multiple_deliveries = st.selectbox(
+            "Multiple deliveries on this trip", [0, 1, 2, 3], index=1
+        )
 
     st.subheader("Locations")
     col3, col4 = st.columns(2)
@@ -166,18 +745,32 @@ with st.form("order_form"):
     with col6:
         ratings = st.number_input("Rider rating", min_value=1.0, max_value=6.0, value=4.7, step=0.1)
     with col7:
-        vehicle_condition = st.selectbox("Vehicle condition (0=poor, 3=best)", [0, 1, 2, 3], index=1)
+        vehicle_condition = st.selectbox(
+            "Vehicle condition (0=poor, 3=best)", [0, 1, 2, 3], index=1
+        )
 
     st.subheader("Conditions")
     col8, col9 = st.columns(2)
     with col8:
-        weather = st.selectbox("Weather", ["Sunny", "Cloudy", "Fog", "Sandstorms", "Stormy", "Windy", "NaN"], index=0)
-        traffic = st.selectbox("Road traffic density", ["Low", "Medium", "High", "Jam"], index=1)
-        vehicle_type = st.selectbox("Vehicle type", ["motorcycle ", "scooter ", "electric_scooter ", "bicycle "], index=0)
+        weather = st.selectbox(
+            "Weather",
+            ["Sunny", "Cloudy", "Fog", "Sandstorms", "Stormy", "Windy", "NaN"],
+            index=0,
+        )
+        traffic = st.selectbox(
+            "Road traffic density", ["Low", "Medium", "High", "Jam"], index=1
+        )
+        vehicle_type = st.selectbox(
+            "Vehicle type", ["motorcycle ", "scooter ", "electric_scooter ", "bicycle "], index=0
+        )
     with col9:
-        order_type = st.selectbox("Type of order", ["Snack ", "Meal ", "Drinks ", "Buffet "], index=0)
+        order_type = st.selectbox(
+            "Type of order", ["Snack ", "Meal ", "Drinks ", "Buffet "], index=0
+        )
         festival = st.selectbox("Festival day", ["No", "Yes"], index=0)
-        city = st.selectbox("City type", ["Urban", "Metropolitian", "Semi-Urban"], index=1)
+        city = st.selectbox(
+            "City type", ["Urban", "Metropolitian", "Semi-Urban"], index=1
+        )
 
     submitted = st.form_submit_button("Predict delivery outcome")
 
@@ -201,11 +794,15 @@ if submitted:
         "city": city,
     }
 
-    X = build_feature_row(order)
+    # SAME prediction logic as original application.
+    X, predicted_minutes, late_proba, is_late = run_existing_prediction(order)
 
-    predicted_minutes = float(linear_model.predict(X)[0])
-    late_proba = float(logistic_model.predict_proba(X)[0][1])
-    is_late = late_proba >= 0.5
+    # Store latest prediction so the top chat can answer follow-up questions
+    # about the manually created prediction.
+    st.session_state.last_prediction_context = make_context(
+        order, X, predicted_minutes, late_proba, is_late
+    )
+    st.session_state.last_prediction_source = "Manual form"
 
     st.divider()
     st.subheader("Prediction")
@@ -232,17 +829,21 @@ if submitted:
             f"is {predicted_minutes:.0f} minutes against the {LATE_THRESHOLD}-minute service level."
         )
 
-    # -- Explanation: top drivers, from the logistic model's coefficients --
     st.subheader("What's driving this prediction")
     coefs = pd.Series(logistic_model.coef_[0], index=FEATURE_ORDER)
     contributions = (coefs * X.iloc[0]).sort_values(key=np.abs, ascending=False)
     top_contributions = contributions[contributions != 0].head(6)
 
     if len(top_contributions) > 0:
-        explain_df = pd.DataFrame({
-            "Factor": top_contributions.index,
-            "Effect on late risk": ["Increases risk" if v > 0 else "Decreases risk" for v in top_contributions],
-        })
+        explain_df = pd.DataFrame(
+            {
+                "Factor": top_contributions.index,
+                "Effect on late risk": [
+                    "Increases risk" if v > 0 else "Decreases risk"
+                    for v in top_contributions
+                ],
+            }
+        )
         st.table(explain_df)
         st.caption(
             "Factors are the active inputs for this order with the largest effect, "
@@ -254,6 +855,19 @@ if submitted:
     with st.expander("See the exact feature values sent to the models"):
         st.dataframe(X.T.rename(columns={0: "value"}))
 
+    if OPENROUTER_API_KEY:
+        with st.spinner("Generating descriptive and prescriptive knowledge..."):
+            insight_text, insight_error = generate_insights(
+                st.session_state.last_prediction_context
+            )
+        st.subheader("🤖 AI Manager Insights")
+        if insight_error:
+            st.warning(insight_error)
+        else:
+            st.markdown(insight_text)
+    else:
+        st.info("Add OPENROUTER_API_KEY in Streamlit Secrets to get descriptive and prescriptive AI knowledge for manual predictions.")
+
 st.divider()
 st.caption(
     "Built for the Zwigato delivery-delay case study. Linear regression estimates delivery "
@@ -261,386 +875,3 @@ st.caption(
     f"delivery time exceeding {LATE_THRESHOLD} minutes — a business rule set for this study, "
     "not a fixed SLA."
 )
-
-
-# =============================================================================
-# OPTIONAL LLM LAYER — ADDED WITHOUT CHANGING THE EXISTING PREDICTION PIPELINE
-# =============================================================================
-# This section only reads the prediction that the existing model already made
-# and sends that context to an LLM for:
-#   1) Descriptive knowledge: What does the prediction mean? What is driving it?
-#   2) Prescriptive knowledge: What can an operations manager do next?
-#   3) Follow-up chatbot questions about the current prediction.
-#
-# The trained models, feature engineering, inputs, prediction calls, and
-# existing explanation table above are intentionally left unchanged.
-#
-# Free option used here: OpenRouter's free router ("openrouter/free").
-# Add OPENROUTER_API_KEY to Streamlit Secrets.
-# =============================================================================
-
-import json
-import os
-import urllib.error
-import urllib.request
-
-
-def _get_secret_or_env(name: str, default=None):
-    try:
-        value = st.secrets.get(name)
-        if value:
-            return value
-    except Exception:
-        pass
-    return os.getenv(name, default)
-
-
-OPENROUTER_API_KEY = _get_secret_or_env("OPENROUTER_API_KEY")
-OPENROUTER_MODEL = _get_secret_or_env("OPENROUTER_MODEL", "openrouter/free")
-
-
-def call_openrouter(messages, temperature=0.2):
-    """Call OpenRouter without adding another Python package."""
-    if not OPENROUTER_API_KEY:
-        return None, (
-            "LLM is not configured yet. Add OPENROUTER_API_KEY to "
-            "Streamlit Secrets to enable the AI assistant."
-        )
-
-    payload = {
-        "model": OPENROUTER_MODEL,
-        "messages": messages,
-        "temperature": temperature,
-    }
-
-    request = urllib.request.Request(
-        "https://openrouter.ai/api/v1/chat/completions",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-            "HTTP-Referer": "https://streamlit.io/",
-            "X-Title": "Zwigato Delivery Delay Predictor",
-        },
-        method="POST",
-    )
-
-    try:
-        with urllib.request.urlopen(request, timeout=45) as response:
-            result = json.loads(response.read().decode("utf-8"))
-            content = result["choices"][0]["message"]["content"]
-            return content, None
-    except urllib.error.HTTPError as exc:
-        try:
-            body = exc.read().decode("utf-8")
-        except Exception:
-            body = str(exc)
-        return None, f"OpenRouter HTTP {exc.code}: {body[:1200]}"
-    except Exception as exc:
-        return None, f"LLM request failed: {exc}"
-
-
-def _clean_context_value(value):
-    """Convert numpy/pandas scalar values into JSON-safe Python values."""
-    try:
-        if hasattr(value, "item"):
-            return value.item()
-    except Exception:
-        pass
-    return value
-
-
-def build_ai_context(order, predicted_minutes, late_proba, is_late, X, contributions):
-    """Create a compact, factual context for the LLM."""
-    active = []
-    for name, value in contributions.items():
-        active.append({
-            "factor": str(name),
-            "model_effect": "increases late risk" if value > 0 else "decreases late risk",
-            "contribution_score": round(float(value), 6),
-        })
-
-    order_context = {
-        "order_date": str(order["order_datetime"].date()),
-        "order_time": str(order["order_datetime"].time()),
-        "estimated_kitchen_preparation_time_min": _clean_context_value(order["prep_time"]),
-        "multiple_deliveries": _clean_context_value(order["multiple_deliveries"]),
-        "restaurant_latitude": _clean_context_value(order["restaurant_lat"]),
-        "restaurant_longitude": _clean_context_value(order["restaurant_lon"]),
-        "delivery_latitude": _clean_context_value(order["delivery_lat"]),
-        "delivery_longitude": _clean_context_value(order["delivery_lon"]),
-        "rider_age": _clean_context_value(order["age"]),
-        "rider_rating": _clean_context_value(order["ratings"]),
-        "vehicle_condition": _clean_context_value(order["vehicle_condition"]),
-        "weather": str(order["weather"]).strip(),
-        "traffic": str(order["traffic"]).strip(),
-        "vehicle_type": str(order["vehicle_type"]).strip(),
-        "order_type": str(order["order_type"]).strip(),
-        "festival": str(order["festival"]).strip(),
-        "city": str(order["city"]).strip(),
-    }
-
-    return {
-        "prediction": {
-            "predicted_delivery_time_minutes": round(float(predicted_minutes), 2),
-            "probability_late_percent": round(float(late_proba) * 100, 2),
-            "late_threshold_minutes": LATE_THRESHOLD,
-            "classification": "LIKELY LATE" if is_late else "LIKELY ON TIME",
-        },
-        "order": order_context,
-        "model_drivers": active,
-        "important_note": (
-            "The ML model describes statistical association, not causation. "
-            "The LLM must not claim that a factor caused the delay unless such "
-            "causal evidence is explicitly available."
-        ),
-    }
-
-
-DESCRIPTIVE_SYSTEM = """
-You are the descriptive analytics layer for a Zwigato delivery-delay model.
-
-The existing ML models are the source of truth. The LLM does not recalculate,
-alter, or second-guess the prediction.
-
-Produce DESCRIPTIVE KNOWLEDGE only:
-- State the predicted delivery time.
-- State the probability that the order is late and the late threshold.
-- Explain what the prediction means in plain language.
-- Explain the model's strongest active positive/negative factors supplied in
-  model_drivers.
-- Describe the order context that is relevant.
-- Clearly separate model output from interpretation.
-- Never claim correlation is causation.
-- Never invent missing values or model results.
-
-Use simple language suitable for an operations manager.
-"""
-
-
-PRESCRIPTIVE_SYSTEM = """
-You are the prescriptive analytics layer for a Zwigato delivery-delay model.
-
-The existing ML prediction is the source of truth.
-
-Produce PRESCRIPTIVE KNOWLEDGE:
-- Recommend practical operational actions that a delivery operations manager
-  can take after seeing the prediction.
-- Prioritize actions that reduce the operational risk represented by the
-  prediction.
-- Recommendations can include adjusting the customer delivery promise,
-  assigning a nearer/more experienced rider where operationally feasible,
-  flagging the order for closer monitoring, checking kitchen preparation,
-  managing multiple-delivery load, or reviewing routing/traffic exposure.
-- Tie every recommendation to the supplied prediction and model_drivers.
-- Do not claim an intervention is guaranteed to reduce delay.
-- Do not invent company policies, costs, staffing levels, routes, or real-time
-  traffic data.
-- Treat recommendations as decision support, not autonomous decisions.
-
-Return:
-1. Immediate action
-2. Operational action
-3. Monitoring action
-4. Why these actions fit this prediction
-
-Use simple, managerial language.
-"""
-
-
-def generate_descriptive_knowledge(context):
-    messages = [
-        {"role": "system", "content": DESCRIPTIVE_SYSTEM},
-        {
-            "role": "user",
-            "content": (
-                "Here is the exact context returned by the existing Zwigato "
-                "prediction app. Produce the descriptive knowledge.\n\n"
-                + json.dumps(context, indent=2, default=str)
-            ),
-        },
-    ]
-    return call_openrouter(messages, temperature=0.1)
-
-
-def generate_prescriptive_knowledge(context):
-    messages = [
-        {"role": "system", "content": PRESCRIPTIVE_SYSTEM},
-        {
-            "role": "user",
-            "content": (
-                "Here is the exact context returned by the existing Zwigato "
-                "prediction app. Produce the prescriptive knowledge.\n\n"
-                + json.dumps(context, indent=2, default=str)
-            ),
-        },
-    ]
-    return call_openrouter(messages, temperature=0.2)
-
-
-def generate_chat_reply(user_question, context, chat_history):
-    chat_system = f"""
-You are the Zwigato Manager AI Assistant.
-
-You are answering follow-up questions about ONE prediction made by the
-existing ML models.
-
-Never change the model output. Use ONLY the supplied prediction context and
-conversation history. You may explain, summarize, compare supplied factors,
-and recommend practical managerial actions. Do not invent live information.
-
-Prediction context:
-{json.dumps(context, indent=2, default=str)}
-
-Remember:
-- descriptive = what the model predicts and what the supplied factors indicate
-- prescriptive = what a manager could do next
-- association is not causation
-- decision support, not autopilot
-"""
-    messages = [{"role": "system", "content": chat_system}]
-    messages.extend(chat_history[-8:])
-    messages.append({"role": "user", "content": user_question})
-    return call_openrouter(messages, temperature=0.2)
-
-
-def render_ai_layer(context):
-    """
-    Additive AI section that reads the last prediction saved by the existing
-    prediction flow. It does not alter or re-run the ML models.
-    """
-    st.divider()
-    st.header("🤖 AI Manager Assistant")
-    st.caption(
-        "The ML model makes the prediction. The LLM adds descriptive and "
-        "prescriptive knowledge around that prediction."
-    )
-
-    if not OPENROUTER_API_KEY:
-        st.info(
-            "Add your OpenRouter key to enable the AI layer. "
-            "The original prediction will continue to work exactly as before."
-        )
-        return
-
-    # Keep generated answers visible across Streamlit reruns.
-    if "ai_descriptive_answer" not in st.session_state:
-        st.session_state.ai_descriptive_answer = None
-    if "ai_prescriptive_answer" not in st.session_state:
-        st.session_state.ai_prescriptive_answer = None
-    if "ai_chat_history" not in st.session_state:
-        st.session_state.ai_chat_history = []
-
-    desc_col, pres_col = st.columns(2)
-
-    with desc_col:
-        st.subheader("📊 Descriptive knowledge")
-        if st.button(
-            "Generate descriptive insight",
-            key="generate_descriptive",
-            use_container_width=True,
-        ):
-            with st.spinner("Generating descriptive knowledge..."):
-                answer, error = generate_descriptive_knowledge(context)
-            if error:
-                st.error(error)
-            else:
-                st.session_state.ai_descriptive_answer = answer
-
-        if st.session_state.ai_descriptive_answer:
-            st.markdown(st.session_state.ai_descriptive_answer)
-
-    with pres_col:
-        st.subheader("🎯 Prescriptive knowledge")
-        if st.button(
-            "Generate recommended actions",
-            key="generate_prescriptive",
-            use_container_width=True,
-        ):
-            with st.spinner("Generating prescriptive knowledge..."):
-                answer, error = generate_prescriptive_knowledge(context)
-            if error:
-                st.error(error)
-            else:
-                st.session_state.ai_prescriptive_answer = answer
-
-        if st.session_state.ai_prescriptive_answer:
-            st.markdown(st.session_state.ai_prescriptive_answer)
-
-    st.subheader("💬 Ask the Manager Assistant")
-
-    for msg in st.session_state.ai_chat_history:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
-
-    question = st.chat_input(
-        "Ask: Why is this order risky? What should I do next?",
-        key="ai_chat_input",
-    )
-
-    if question:
-        history_before_question = list(st.session_state.ai_chat_history)
-
-        st.session_state.ai_chat_history.append(
-            {"role": "user", "content": question}
-        )
-
-        with st.chat_message("user"):
-            st.markdown(question)
-
-        with st.chat_message("assistant"):
-            with st.spinner("Thinking about the current prediction..."):
-                answer, error = generate_chat_reply(
-                    question, context, history_before_question
-                )
-            if error:
-                st.error(error)
-                answer = f"LLM error: {error}"
-            else:
-                st.markdown(answer)
-
-        st.session_state.ai_chat_history.append(
-            {"role": "assistant", "content": answer}
-        )
-
-    if st.button("Clear AI chat", key="clear_ai_chat"):
-        st.session_state.ai_chat_history = []
-        st.rerun()
-
-
-# -----------------------------------------------------------------------------
-# SAVE THE LAST EXISTING MODEL PREDICTION (ADDITIVE ONLY)
-# -----------------------------------------------------------------------------
-# This small state block does not change the prediction itself. It only stores
-# the already-calculated result so the chatbot can continue working after
-# Streamlit reruns caused by chat messages or AI buttons.
-if "last_prediction_context" not in st.session_state:
-    st.session_state.last_prediction_context = None
-
-if "submitted" in globals() and submitted:
-    coefs = pd.Series(logistic_model.coef_[0], index=FEATURE_ORDER)
-    contributions_series = (coefs * X.iloc[0]).sort_values(
-        key=np.abs, ascending=False
-    )
-    top_contributions = contributions_series[
-        contributions_series != 0
-    ].head(6)
-
-    st.session_state.last_prediction_context = build_ai_context(
-        order=order,
-        predicted_minutes=predicted_minutes,
-        late_proba=late_proba,
-        is_late=is_late,
-        X=X,
-        contributions=top_contributions.to_dict(),
-    )
-
-    # New prediction = new case, so clear old AI answers and conversation.
-    st.session_state.ai_descriptive_answer = None
-    st.session_state.ai_prescriptive_answer = None
-    st.session_state.ai_chat_history = []
-
-# Render the AI layer whenever a prediction exists, not only on the form-submit
-# rerun. This keeps the chatbot usable without changing the existing model UI.
-if st.session_state.last_prediction_context is not None:
-    render_ai_layer(st.session_state.last_prediction_context)
