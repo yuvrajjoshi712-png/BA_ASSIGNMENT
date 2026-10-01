@@ -17,6 +17,7 @@ Model files expected alongside this script:
 
 import datetime as dt
 import json
+import time
 import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
@@ -201,13 +202,35 @@ OPENROUTER_MODEL = get_secret("OPENROUTER_MODEL", "qwen/qwen3.8-27b:free")
 if OPENROUTER_MODEL.strip() == "openrouter/free":
     OPENROUTER_MODEL = "qwen/qwen3.8-27b:free"
 
-# Free fallback models in case the primary free endpoint is temporarily
-# unavailable or returns an empty completion. All remain on OpenRouter.
-OPENROUTER_FALLBACK_MODELS = [
+# Free models on OpenRouter rotate often (slugs get renamed, removed or rate-limited),
+# so instead of hard-coding a list we ask OpenRouter which models are free *right now*.
+# The list is cached for an hour. If that lookup fails, a small static list is used.
+_STATIC_FREE_FALLBACKS = [
     "qwen/qwen3.8-27b:free",
-    "deepseek/deepseek-v4-flash-0731:free",
-    "deepseek/deepseek-chat:free",
+    "openrouter/free",   # OpenRouter's own router: picks any currently-free model
 ]
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_free_openrouter_models(limit: int = 6) -> List[str]:
+    """Return IDs of text models that currently cost $0, largest context first."""
+    try:
+        r = requests.get("https://openrouter.ai/api/v1/models", timeout=15)
+        r.raise_for_status()
+        found = []
+        for m in r.json().get("data", []):
+            mid = m.get("id", "")
+            pricing = m.get("pricing") or {}
+            arch = m.get("architecture") or {}
+            is_free = str(pricing.get("prompt")) == "0" and str(pricing.get("completion")) == "0"
+            text_in = "text" in (arch.get("input_modalities") or ["text"])
+            text_out = (arch.get("output_modalities") or ["text"]) == ["text"]
+            if mid.endswith(":free") and is_free and text_in and text_out:
+                found.append((m.get("context_length") or 0, mid))
+        found.sort(reverse=True)
+        return [mid for _, mid in found[:limit]]
+    except Exception:
+        return []
 
 
 def _extract_text_from_openrouter_response(data: dict) -> str:
@@ -258,9 +281,10 @@ def call_openrouter(
     }
 
     # Try the configured model first, then a couple of current free fallbacks.
-    models_to_try = [OPENROUTER_MODEL] + [
-        m for m in OPENROUTER_FALLBACK_MODELS if m != OPENROUTER_MODEL
-    ]
+    models_to_try = []
+    for m in [OPENROUTER_MODEL] + get_free_openrouter_models() + _STATIC_FREE_FALLBACKS:
+        if m and m not in models_to_try:
+            models_to_try.append(m)
 
     errors = []
 
@@ -275,15 +299,21 @@ def call_openrouter(
             "reasoning": {"enabled": False},
         }
 
-        try:
-            response = requests.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                headers=headers,
-                json=payload,
-                timeout=45,
-            )
-        except requests.RequestException as exc:
-            errors.append(f"{model_name}: request failed: {exc}")
+        response = None
+        for attempt in range(1):
+            try:
+                response = requests.post(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    headers=headers,
+                    json=payload,
+                    timeout=30,
+                )
+            except requests.RequestException as exc:
+                errors.append(f"{model_name}: request failed: {exc}")
+                response = None
+                break
+            break
+        if response is None:
             continue
 
         if response.status_code == 401:
@@ -297,7 +327,15 @@ def call_openrouter(
                 body = response.json()
             except ValueError:
                 body = response.text[:1000]
-            errors.append(f"{model_name}: HTTP {response.status_code}: {body}")
+            if response.status_code == 402:
+                reason = "no credits on the OpenRouter account"
+            elif response.status_code == 429:
+                reason = "rate-limited"
+            elif response.status_code == 404:
+                reason = "model not available under this name"
+            else:
+                reason = str(body)[:120]
+            errors.append(f"{model_name}: HTTP {response.status_code} ({reason})")
             continue
 
         try:
@@ -317,8 +355,7 @@ def call_openrouter(
         errors.append(f"{model_name}: empty completion")
 
     return None, (
-        "OpenRouter could not return a text response from the available free models. "
-        "Please try the question again in a moment. "
+        "All free OpenRouter models are busy right now. Please wait a minute and ask again. "
         + " | ".join(errors[-3:])
     )
 
