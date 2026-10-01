@@ -28,7 +28,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="Zwigato Delivery Delay Predictor", page_icon="🛵", layout="centered")
+st.set_page_config(page_title="Zwigato Delivery Delay Predictor", page_icon="🛵", layout="centered", initial_sidebar_state="collapsed")
 
 LATE_THRESHOLD = 30
 
@@ -567,332 +567,470 @@ def generate_followup(question: str, context: dict, history: List[Dict[str, str]
 
 
 # =============================================================================
+# STYLING
+# =============================================================================
+st.markdown(
+    """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Sora:wght@600;700&family=Manrope:wght@400;500;600;700&display=swap');
+:root{
+  --ink:#1B1F2A; --muted:#667085; --line:#E4E7EC; --canvas:#F6F7F9; --card:#FFFFFF;
+  --red:#E23744; --red-soft:#FFF1F2; --green:#157F54; --green-soft:#E8F6EF; --amber:#B54708; --amber-soft:#FEF0E3;
+}
+.stApp{ background:var(--canvas); font-family:'Manrope',system-ui,-apple-system,'Segoe UI',sans-serif; color:var(--ink); }
+.block-container{ max-width:820px; padding-top:2.2rem; padding-bottom:6rem; }
+#MainMenu, footer{ visibility:hidden; }
+
+/* Header */
+.zw-hero{ display:flex; gap:16px; align-items:center; margin-bottom:1.6rem; }
+.zw-logo{ width:52px; height:52px; border-radius:14px; background:var(--red); display:flex; align-items:center; justify-content:center; font-size:28px; flex:none; }
+.zw-title{ font-family:'Sora','Manrope',sans-serif; font-weight:700; font-size:1.65rem; line-height:1.2; color:var(--ink); letter-spacing:-0.02em; }
+.zw-sub{ color:var(--muted); font-size:0.95rem; margin-top:4px; }
+
+/* Section headings */
+.zw-h{ font-family:'Sora','Manrope',sans-serif; font-weight:600; font-size:1.05rem; color:var(--ink); margin:1.4rem 0 0.6rem 0; }
+.zw-note{ color:var(--muted); font-size:0.9rem; margin:-0.3rem 0 0.8rem 0; }
+
+/* Method cards */
+[class*="st-key-card_"]{ background:var(--card); border:1.5px solid var(--line) !important; border-radius:16px !important; padding:6px 6px 2px 6px; }
+[class*="st-key-card_"][class*="_on"]{ border:2px solid var(--red) !important; background:var(--red-soft); }
+.zw-card-icon{ font-size:1.6rem; margin-bottom:2px; }
+.zw-card-title{ font-family:'Sora','Manrope',sans-serif; font-weight:600; font-size:1.02rem; color:var(--ink); }
+.zw-card-desc{ color:var(--muted); font-size:0.88rem; margin:4px 0 10px 0; min-height:2.6em; }
+
+/* Result tiles */
+.zw-tiles{ display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin:2px 0 14px 0; }
+.zw-tile{ background:var(--card); border:1px solid var(--line); border-radius:14px; padding:12px 14px; }
+.zw-k{ color:var(--muted); font-size:0.78rem; margin-bottom:4px; }
+.zw-v{ font-family:'Sora','Manrope',sans-serif; font-weight:700; font-size:1.7rem; color:var(--ink); line-height:1.1; }
+.zw-v span{ font-size:0.9rem; font-weight:600; color:var(--muted); margin-left:2px; }
+.zw-v.zw-status{ font-size:1.15rem; padding-top:6px; }
+.zw-tile.zw-late{ background:var(--amber-soft); border-color:#F4C79B; }
+.zw-tile.zw-late .zw-v{ color:var(--amber); }
+.zw-tile.zw-ok{ background:var(--green-soft); border-color:#A9DCC4; }
+.zw-tile.zw-ok .zw-v{ color:var(--green); }
+@media (max-width:640px){ .zw-tiles{ grid-template-columns:1fr; } .zw-title{ font-size:1.35rem; } }
+
+/* Manual form groups */
+[class*="st-key-grp_"]{ background:var(--card); border:1px solid var(--line) !important; border-radius:14px !important; }
+.zw-grp{ font-family:'Sora','Manrope',sans-serif; font-weight:600; font-size:0.95rem; margin-bottom:2px; color:var(--ink); }
+
+/* Buttons */
+.stButton > button, [data-testid="stFormSubmitButton"] > button{ border-radius:10px; font-weight:600; }
+button[data-testid="stBaseButton-primary"], button[data-testid="stBaseButton-primaryFormSubmit"]{ background:var(--red); border-color:var(--red); }
+button[data-testid="stBaseButton-primary"]:hover, button[data-testid="stBaseButton-primaryFormSubmit"]:hover{ background:#C42B38; border-color:#C42B38; }
+:focus-visible{ outline:2px solid var(--red) !important; outline-offset:2px; }
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+
+# =============================================================================
 # SESSION STATE
 # =============================================================================
-if "chat_messages" not in st.session_state:
+_defaults = {
+    "mode": None,               # None | "ai" | "manual"
+    "chat_messages": [],        # [{"role", "content", "result"}]
+    "chat_draft": blank_order(),
+    "last_context": None,
+    "last_ai_insights": None,
+    "last_ai_error": None,
+    "manual_result": None,      # stored so the result survives reruns
+}
+for _k, _v in _defaults.items():
+    if _k not in st.session_state:
+        st.session_state[_k] = _v
+
+
+# =============================================================================
+# SMALL UI HELPERS
+# =============================================================================
+def set_mode(mode: str) -> None:
+    st.session_state.mode = mode
+
+
+def clear_chat() -> None:
     st.session_state.chat_messages = []
-if "chat_draft" not in st.session_state:
     st.session_state.chat_draft = blank_order()
-if "last_context" not in st.session_state:
-    st.session_state.last_context = None
-if "last_ai_insights" not in st.session_state:
-    st.session_state.last_ai_insights = None
-if "last_ai_error" not in st.session_state:
-    st.session_state.last_ai_error = None
 
 
-# =============================================================================
-# TOP NATURAL-LANGUAGE ASSISTANT
-# =============================================================================
-st.title("🛵 Zwigato Delivery Delay Predictor")
-st.caption(
-    "Enter the order manually below or describe it here in your own words. "
-    "Both options use the same existing ML models."
-)
+def use_example(text: str) -> None:
+    st.session_state.pending_prompt = text
 
-st.subheader("💬 Ask in your own words")
-st.caption(
-    "Example: *30-year-old rider, rating 4.8, good vehicle, high traffic, rainy weather, "
-    "2 other deliveries...*"
-)
 
-# Use text_area + button instead of st.chat_input so the chat box is visibly at the TOP.
-with st.container(border=True):
-    chat_text = st.text_area(
-        "Describe the order",
-        placeholder=(
-            "Example: The rider is 30, has a 4.8 rating, the vehicle is in good condition, "
-            "traffic is high and it is raining..."
-        ),
-        height=100,
-        label_visibility="collapsed",
+def render_tiles(minutes: float, prob_pct: float, is_late: bool) -> None:
+    cls = "zw-late" if is_late else "zw-ok"
+    status = "Likely late" if is_late else "Likely on time"
+    st.markdown(
+        '<div class="zw-tiles">'
+        f'<div class="zw-tile"><div class="zw-k">Predicted delivery time</div>'
+        f'<div class="zw-v">{minutes:.0f}<span>min</span></div></div>'
+        f'<div class="zw-tile"><div class="zw-k">Chance of being late</div>'
+        f'<div class="zw-v">{prob_pct:.0f}<span>%</span></div></div>'
+        f'<div class="zw-tile {cls}"><div class="zw-k">Verdict (limit {LATE_THRESHOLD} min)</div>'
+        f'<div class="zw-v zw-status">{status}</div></div>'
+        "</div>",
+        unsafe_allow_html=True,
     )
-    ask = st.button("Ask Assistant", type="primary", use_container_width=True)
 
-if chat_text and ask:
-    st.session_state.chat_messages.append({"role": "user", "content": chat_text})
 
-    with st.chat_message("user"):
-        st.markdown(chat_text)
-
-    with st.chat_message("assistant"):
-        with st.spinner("Understanding the order details..."):
-            parsed, parse_error = parse_user_order(chat_text)
-
-        if parse_error:
-            answer = (
-                "I couldn't connect to the AI language service right now. "
-                "Your manual prediction below is unaffected."
+def history_for_llm(messages: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    """Strip UI-only keys and re-add the numbers so follow-up questions have context."""
+    out = []
+    for m in messages:
+        text = m.get("content", "")
+        r = m.get("result")
+        if r:
+            verdict = "likely late" if r["late"] else "likely on time"
+            text = (
+                f"Predicted delivery time: {r['minutes']:.0f} minutes; "
+                f"late probability {r['prob']:.0f}%; {verdict}.\n\n" + text
             )
-            st.error(parse_error)
-        else:
-            intent = parsed.get("intent", "new_prediction")
-            reply = parsed.get("reply", "")
+        out.append({"role": m["role"], "content": text})
+    return out
 
-            if intent == "follow_up" and st.session_state.last_context:
-                history = list(st.session_state.chat_messages[:-1])
-                answer, follow_error = generate_followup(
-                    chat_text, st.session_state.last_context, history
-                )
-                if follow_error:
-                    answer = "I couldn't generate the AI response right now."
-                    st.error(follow_error)
-                else:
-                    st.markdown(answer)
 
-            elif intent == "general" and st.session_state.last_context is None:
-                answer = reply or "Describe a delivery order and I will help you assess its delay risk."
-                st.markdown(answer)
-
-            else:
-                st.session_state.chat_draft = merge_orders(
-                    st.session_state.chat_draft,
-                    parsed.get("order", {}) or {},
-                )
-                draft = st.session_state.chat_draft
-                missing = missing_fields(draft)
-
-                if missing:
-                    friendly = reply or "I have captured some of the order details."
-                    human_names = [FIELD_HELP[field] for field in missing]
-                    if len(human_names) <= 4:
-                        ask_for = ", ".join(human_names)
-                    else:
-                        ask_for = ", ".join(human_names[:4]) + f", and {len(human_names) - 4} more"
-                    answer = f"{friendly}\n\nI still need **{ask_for}** before I can run the existing model."
-                    st.markdown(answer)
-                else:
-                    try:
-                        order = convert_chat_order(draft)
-                        validate_chat_order(order)
-                        X, predicted_minutes, late_proba, is_late = run_existing_prediction(order)
-                        context = make_model_context(order, X, predicted_minutes, late_proba, is_late)
-                        st.session_state.last_context = context
-                        st.session_state.chat_draft = blank_order()
-
-                        st.markdown(
-                            f"**Predicted delivery time:** {predicted_minutes:.0f} minutes  \n"
-                            f"**Late-delivery probability:** {late_proba * 100:.0f}%  \n"
-                            f"**Status:** {'Likely late' if is_late else 'Likely on time'}"
-                        )
-
-                        insights, insight_error = generate_manager_insights(context)
-                        st.session_state.last_ai_insights = insights
-                        st.session_state.last_ai_error = insight_error
-                        if insight_error:
-                            st.info(
-                                "The ML prediction is complete. AI descriptive/prescriptive knowledge "
-                                "could not be generated at the moment."
-                            )
-                            answer = (
-                                f"**Predicted delivery time:** {predicted_minutes:.0f} minutes  \n"
-                                f"**Late-delivery probability:** {late_proba * 100:.0f}%  \n"
-                                f"**Status:** {'Likely late' if is_late else 'Likely on time'}"
-                            )
-                        else:
-                            st.markdown(insights)
-                            answer = (
-                                f"**Predicted delivery time:** {predicted_minutes:.0f} minutes  \n"
-                                f"**Late-delivery probability:** {late_proba * 100:.0f}%  \n"
-                                f"**Status:** {'Likely late' if is_late else 'Likely on time'}\n\n"
-                                + (insights or "")
-                            )
-                    except Exception as exc:
-                        answer = f"I understood the message, but the existing model could not run: {exc}"
-                        st.error(answer)
-
-        st.session_state.chat_messages.append({"role": "assistant", "content": answer})
-
-# Render previous chat in a compact history area.
-if st.session_state.chat_messages:
-    with st.expander("Conversation history", expanded=False):
-        for msg in st.session_state.chat_messages:
-            st.markdown(f"**{'You' if msg['role'] == 'user' else 'Assistant'}:** {msg['content']}")
-        if st.button("Clear conversation", key="clear_chat"):
-            st.session_state.chat_messages = []
-            st.session_state.chat_draft = blank_order()
-            st.rerun()
+def show_ai_problem(headline: str, detail: Optional[str]) -> None:
+    st.warning(headline)
+    if detail:
+        with st.expander("Technical details"):
+            st.code(detail)
 
 
 # =============================================================================
-# LAST AI KNOWLEDGE — visible after a prediction
+# HEADER + METHOD PICKER
 # =============================================================================
-if st.session_state.last_context is not None:
-    context = st.session_state.last_context
-    p = context["prediction"]
+st.markdown(
+    '<div class="zw-hero"><div class="zw-logo">🛵</div><div>'
+    '<div class="zw-title">Zwigato Delivery Delay Predictor</div>'
+    '<div class="zw-sub">Check whether an order is likely to arrive late, and what the manager can do about it.</div>'
+    "</div></div>",
+    unsafe_allow_html=True,
+)
 
-    st.divider()
-    st.subheader("🤖 AI Manager Knowledge")
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.metric("Predicted delivery time", f"{p['predicted_delivery_time_minutes']:.0f} min")
-    with c2:
-        st.metric("Late probability", f"{p['late_probability_percent']:.0f}%")
-    with c3:
-        st.metric("Model status", p["classification"])
+st.markdown('<div class="zw-h">How would you like to enter the order?</div>', unsafe_allow_html=True)
 
-    if st.session_state.last_ai_error:
-        st.info("AI explanation is temporarily unavailable; the ML prediction above is still valid.")
-    elif st.session_state.last_ai_insights:
-        st.markdown(st.session_state.last_ai_insights)
+_methods = [
+    ("ai", "💬", "Describe it in words",
+     "Type the order in plain English. The AI assistant picks out the details and asks for anything missing."),
+    ("manual", "🧮", "Fill in the form",
+     "Enter every detail yourself for full control. The prediction itself needs no AI."),
+]
+_cols = st.columns(2)
+for _col, (_key, _icon, _title, _desc) in zip(_cols, _methods):
+    _selected = st.session_state.mode == _key
+    with _col:
+        with st.container(border=True, key=f"card_{_key}_{'on' if _selected else 'off'}"):
+            st.markdown(
+                f'<div class="zw-card-icon">{_icon}</div>'
+                f'<div class="zw-card-title">{_title}</div>'
+                f'<div class="zw-card-desc">{_desc}</div>',
+                unsafe_allow_html=True,
+            )
+            st.button(
+                "Selected" if _selected else "Choose this",
+                key=f"pick_{_key}",
+                on_click=set_mode,
+                args=(_key,),
+                type="primary" if _selected else "secondary",
+                use_container_width=True,
+            )
 
-    st.caption("The ML model makes the prediction; the AI layer adds descriptive and prescriptive knowledge.")
-
-
-# =============================================================================
-# EXISTING MANUAL PREDICTION FORM — BELOW THE CHAT
-# =============================================================================
-st.divider()
-st.subheader("🧮 Manual Prediction")
-st.caption("Use the original parameter-entry interface when you want complete manual control.")
-
-with st.form("order_form"):
-    st.subheader("Order details")
-
-    col1, col2 = st.columns(2)
-    with col1:
-        order_date = st.date_input("Order date", value=dt.date.today())
-        order_time = st.time_input("Order time", value=dt.time(19, 0))
-    with col2:
-        prep_time = st.number_input(
-            "Estimated kitchen preparation time (minutes)",
-            min_value=0.0, max_value=60.0, value=15.0, step=1.0,
-            help="Expected time between the order being placed and the rider picking it up.",
-        )
-        multiple_deliveries = st.selectbox("Multiple deliveries on this trip", [0, 1, 2, 3], index=1)
-
-    st.subheader("Locations")
-    col3, col4 = st.columns(2)
-    with col3:
-        st.markdown("**Restaurant**")
-        restaurant_lat = st.number_input("Restaurant latitude", value=12.9716, format="%.6f")
-        restaurant_lon = st.number_input("Restaurant longitude", value=77.5946, format="%.6f")
-    with col4:
-        st.markdown("**Delivery location**")
-        delivery_lat = st.number_input("Delivery latitude", value=13.0500, format="%.6f")
-        delivery_lon = st.number_input("Delivery longitude", value=77.6500, format="%.6f")
-
-    st.subheader("Rider")
-    col5, col6, col7 = st.columns(3)
-    with col5:
-        age = st.number_input("Rider age", min_value=15, max_value=50, value=30)
-    with col6:
-        ratings = st.number_input("Rider rating", min_value=1.0, max_value=6.0, value=4.7, step=0.1)
-    with col7:
-        vehicle_condition = st.selectbox("Vehicle condition (0=poor, 3=best)", [0, 1, 2, 3], index=1)
-
-    st.subheader("Conditions")
-    col8, col9 = st.columns(2)
-    with col8:
-        weather = st.selectbox("Weather", ["Sunny", "Cloudy", "Fog", "Sandstorms", "Stormy", "Windy", "NaN"], index=0)
-        traffic = st.selectbox("Road traffic density", ["Low", "Medium", "High", "Jam"], index=1)
-        vehicle_type = st.selectbox("Vehicle type", ["motorcycle ", "scooter ", "electric_scooter ", "bicycle "], index=0)
-    with col9:
-        order_type = st.selectbox("Type of order", ["Snack ", "Meal ", "Drinks ", "Buffet "], index=0)
-        festival = st.selectbox("Festival day", ["No", "Yes"], index=0)
-        city = st.selectbox("City type", ["Urban", "Metropolitian", "Semi-Urban"], index=1)
-
-    submitted = st.form_submit_button("Predict delivery outcome")
-
-if submitted:
-    order = {
-        "order_datetime": dt.datetime.combine(order_date, order_time),
-        "prep_time": prep_time,
-        "multiple_deliveries": multiple_deliveries,
-        "restaurant_lat": restaurant_lat,
-        "restaurant_lon": restaurant_lon,
-        "delivery_lat": delivery_lat,
-        "delivery_lon": delivery_lon,
-        "age": age,
-        "ratings": ratings,
-        "vehicle_condition": vehicle_condition,
-        "weather": weather,
-        "traffic": traffic,
-        "vehicle_type": vehicle_type,
-        "order_type": order_type,
-        "festival": festival,
-        "city": city,
-    }
-
-    X = build_feature_row(order)
-    predicted_minutes = float(linear_model.predict(X)[0])
-    late_proba = float(logistic_model.predict_proba(X)[0][1])
-    is_late = late_proba >= 0.5
-
-    st.session_state.last_context = make_model_context(
-        order, X, predicted_minutes, late_proba, is_late
+if st.session_state.mode is None:
+    st.markdown(
+        f'<div class="zw-note" style="margin-top:1.2rem">Pick a method above to begin. '
+        f'An order counts as late when delivery takes more than {LATE_THRESHOLD} minutes.</div>',
+        unsafe_allow_html=True,
     )
 
-    st.divider()
-    st.subheader("Prediction")
 
-    res1, res2 = st.columns(2)
-    with res1:
-        st.metric("Predicted delivery time", f"{predicted_minutes:.0f} min")
-    with res2:
-        st.metric(
-            f"Probability of being late (> {LATE_THRESHOLD} min)",
-            f"{late_proba * 100:.0f}%",
-            delta="Likely late" if is_late else "Likely on time",
-            delta_color="inverse" if is_late else "normal",
-        )
+# =============================================================================
+# MODE 1 — AI ASSISTANT
+# =============================================================================
+EXAMPLE_ORDERS = [
+    "Rider is 30 with a 4.8 rating, bike in good shape, two other deliveries. Evening rush, heavy traffic and raining. "
+    "Kitchen needs 20 minutes. Restaurant at 12.9716, 77.5946 and customer at 13.0500, 77.6500. "
+    "Normal meal order in an urban area, no festival.",
+    "Rider is 24, rated 4.2, scooter in average condition, no other deliveries. Clear weather, low traffic, "
+    "snack order, prep time 10 minutes. Restaurant 12.9716, 77.5946, customer 12.9850, 77.6100. "
+    "Metropolitan city, not a festival day.",
+]
 
-    if is_late:
-        st.warning(
-            f"This order is flagged as **likely late** — predicted delivery time "
-            f"is {predicted_minutes:.0f} minutes against the {LATE_THRESHOLD}-minute service level."
+
+def process_chat_message(chat_text: str, history: List[Dict[str, str]]) -> Tuple[str, Optional[dict]]:
+    """Runs inside an assistant chat bubble. Returns (text to store, result dict or None)."""
+    with st.spinner("Reading the order details..."):
+        parsed, parse_error = parse_user_order(chat_text)
+
+    if parse_error:
+        show_ai_problem(
+            "The AI service isn't responding right now. Try again in a minute, or use the form instead.",
+            parse_error,
         )
+        return "The AI service wasn't available for this message.", None
+
+    intent = parsed.get("intent", "new_prediction")
+    reply = parsed.get("reply", "")
+
+    if intent == "follow_up" and st.session_state.last_context:
+        answer, follow_error = generate_followup(chat_text, st.session_state.last_context, history)
+        if follow_error:
+            show_ai_problem("I couldn't write a reply just now. Please try again.", follow_error)
+            return "I couldn't write a reply for that question.", None
+        st.markdown(answer)
+        return answer, None
+
+    if intent == "general" and st.session_state.last_context is None:
+        answer = reply or "Describe a delivery order and I'll assess its delay risk."
+        st.markdown(answer)
+        return answer, None
+
+    st.session_state.chat_draft = merge_orders(st.session_state.chat_draft, parsed.get("order", {}) or {})
+    draft = st.session_state.chat_draft
+    missing = missing_fields(draft)
+
+    if missing:
+        friendly = reply or "I've captured some of the order details."
+        names = [FIELD_HELP[f] for f in missing]
+        ask_for = ", ".join(names) if len(names) <= 4 else ", ".join(names[:4]) + f", and {len(names) - 4} more"
+        answer = f"{friendly}\n\nI still need **{ask_for}** before I can run the prediction."
+        st.markdown(answer)
+        return answer, None
+
+    try:
+        order = convert_chat_order(draft)
+        validate_chat_order(order)
+        X, predicted_minutes, late_proba, is_late = run_existing_prediction(order)
+        context = make_model_context(order, X, predicted_minutes, late_proba, is_late)
+        st.session_state.last_context = context
+        st.session_state.chat_draft = blank_order()
+    except Exception as exc:
+        msg = f"I understood the message, but the model couldn't run: {exc}"
+        st.error(msg)
+        return msg, None
+
+    result = {"minutes": predicted_minutes, "prob": late_proba * 100, "late": bool(is_late)}
+    render_tiles(result["minutes"], result["prob"], result["late"])
+
+    with st.spinner("Writing manager advice..."):
+        insights, insight_error = generate_manager_insights(context)
+    st.session_state.last_ai_insights = insights
+    st.session_state.last_ai_error = insight_error
+
+    if insight_error:
+        show_ai_problem(
+            "The prediction is ready, but the written advice couldn't be generated right now.",
+            insight_error,
+        )
+        return "", result
+    st.markdown(insights)
+    return insights or "", result
+
+
+def render_ai_mode() -> None:
+    # chat_input clears itself after sending, so the old text never lingers in the box.
+    prompt = st.chat_input("Describe the order: rider, traffic, weather, locations, kitchen time...")
+    if not prompt:
+        prompt = st.session_state.pop("pending_prompt", None)
+
+    messages = st.session_state.chat_messages
+
+    if not messages and not prompt:
+        st.markdown('<div class="zw-h">Describe the order</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="zw-note">Mention the rider (age, rating), vehicle, traffic, weather, kitchen time, '
+            "and where the restaurant and customer are. If something is missing, the assistant will ask. "
+            "Type below, or try an example:</div>",
+            unsafe_allow_html=True,
+        )
+        ex_cols = st.columns(2)
+        for i, (col, label) in enumerate(zip(ex_cols, ["Rainy evening rush", "Calm afternoon"])):
+            with col:
+                st.button(label, key=f"ex_{i}", on_click=use_example, args=(EXAMPLE_ORDERS[i],),
+                          use_container_width=True)
     else:
-        st.success(
-            f"This order is flagged as **likely on time** — predicted delivery time "
-            f"is {predicted_minutes:.0f} minutes against the {LATE_THRESHOLD}-minute service level."
-        )
+        top_l, top_r = st.columns([4, 1])
+        with top_l:
+            st.markdown('<div class="zw-h" style="margin-top:0.6rem">Conversation</div>', unsafe_allow_html=True)
+        with top_r:
+            st.button("Start over", key="clear_chat", on_click=clear_chat, use_container_width=True)
 
-    st.subheader("What's driving this prediction")
-    coefs = pd.Series(logistic_model.coef_[0], index=FEATURE_ORDER)
-    contributions = (coefs * X.iloc[0]).sort_values(key=np.abs, ascending=False)
-    top_contributions = contributions[contributions != 0].head(6)
+    for m in messages:
+        with st.chat_message(m["role"], avatar="🛵" if m["role"] == "assistant" else None):
+            if m.get("result"):
+                r = m["result"]
+                render_tiles(r["minutes"], r["prob"], r["late"])
+            if m.get("content"):
+                st.markdown(m["content"])
 
-    if len(top_contributions) > 0:
-        explain_df = pd.DataFrame({
-            "Factor": top_contributions.index,
-            "Effect on late risk": ["Increases risk" if v > 0 else "Decreases risk" for v in top_contributions],
-        })
-        st.table(explain_df)
-        st.caption(
-            "Factors are the active inputs for this order with the largest effect, "
-            "positive or negative, on the logistic model's late-delivery score."
-        )
-    else:
-        st.caption("No single input stands out strongly for this particular order.")
+    if prompt:
+        history = history_for_llm(messages)
+        with st.chat_message("user"):
+            st.markdown(prompt)
+        messages.append({"role": "user", "content": prompt})
+        with st.chat_message("assistant", avatar="🛵"):
+            answer, result = process_chat_message(prompt, history)
+        messages.append({"role": "assistant", "content": answer, "result": result})
 
-    with st.expander("See the exact feature values sent to the models"):
-        st.dataframe(X.T.rename(columns={0: "value"}))
 
-    # Additive LLM layer: descriptive + prescriptive knowledge from the existing ML result.
-    if OPENROUTER_API_KEY:
-        with st.spinner("Generating descriptive and prescriptive knowledge..."):
-            insights, ai_error = generate_manager_insights(st.session_state.last_context)
-        st.session_state.last_ai_insights = insights
-        st.session_state.last_ai_error = ai_error
-        st.divider()
-        st.subheader("🤖 AI Manager Knowledge")
-        if ai_error:
-            st.info("The ML prediction is complete, but the AI explanation could not be generated right now.")
+# =============================================================================
+# MODE 2 — MANUAL FORM
+# =============================================================================
+def render_manual_mode() -> None:
+    st.markdown('<div class="zw-h">Order details</div>', unsafe_allow_html=True)
+
+    with st.form("order_form", border=False):
+        with st.container(border=True, key="grp_order"):
+            st.markdown('<div class="zw-grp">Order</div>', unsafe_allow_html=True)
+            c1, c2 = st.columns(2)
+            with c1:
+                order_date = st.date_input("Order date", value=dt.date.today())
+                order_time = st.time_input("Order time", value=dt.time(19, 0))
+            with c2:
+                prep_time = st.number_input(
+                    "Kitchen preparation time (minutes)",
+                    min_value=0.0, max_value=60.0, value=15.0, step=1.0,
+                    help="Expected time between the order being placed and the rider picking it up.",
+                )
+                multiple_deliveries = st.selectbox("Other deliveries on this trip", [0, 1, 2, 3], index=1)
+
+        with st.container(border=True, key="grp_locations"):
+            st.markdown('<div class="zw-grp">Locations</div>', unsafe_allow_html=True)
+            c3, c4 = st.columns(2)
+            with c3:
+                restaurant_lat = st.number_input("Restaurant latitude", value=12.9716, format="%.6f")
+                restaurant_lon = st.number_input("Restaurant longitude", value=77.5946, format="%.6f")
+            with c4:
+                delivery_lat = st.number_input("Customer latitude", value=13.0500, format="%.6f")
+                delivery_lon = st.number_input("Customer longitude", value=77.6500, format="%.6f")
+
+        with st.container(border=True, key="grp_rider"):
+            st.markdown('<div class="zw-grp">Rider and vehicle</div>', unsafe_allow_html=True)
+            c5, c6, c7 = st.columns(3)
+            with c5:
+                age = st.number_input("Rider age", min_value=15, max_value=50, value=30)
+                vehicle_type = st.selectbox(
+                    "Vehicle type", ["motorcycle ", "scooter ", "electric_scooter ", "bicycle "],
+                    index=0, format_func=lambda v: v.strip().replace("_", " "),
+                )
+            with c6:
+                ratings = st.number_input("Rider rating", min_value=1.0, max_value=6.0, value=4.7, step=0.1)
+            with c7:
+                vehicle_condition = st.selectbox("Vehicle condition (0 = poor, 3 = best)", [0, 1, 2, 3], index=1)
+
+        with st.container(border=True, key="grp_conditions"):
+            st.markdown('<div class="zw-grp">Conditions</div>', unsafe_allow_html=True)
+            c8, c9 = st.columns(2)
+            with c8:
+                weather = st.selectbox(
+                    "Weather", ["Sunny", "Cloudy", "Fog", "Sandstorms", "Stormy", "Windy", "NaN"], index=0)
+                traffic = st.selectbox("Road traffic density", ["Low", "Medium", "High", "Jam"], index=1)
+                city = st.selectbox("City type", ["Urban", "Metropolitian", "Semi-Urban"], index=1)
+            with c9:
+                order_type = st.selectbox(
+                    "Type of order", ["Snack ", "Meal ", "Drinks ", "Buffet "], index=0,
+                    format_func=lambda v: v.strip())
+                festival = st.selectbox("Festival day", ["No", "Yes"], index=0)
+
+        submitted = st.form_submit_button("Predict delivery outcome", type="primary", use_container_width=True)
+
+    if submitted:
+        order = {
+            "order_datetime": dt.datetime.combine(order_date, order_time),
+            "prep_time": prep_time,
+            "multiple_deliveries": multiple_deliveries,
+            "restaurant_lat": restaurant_lat,
+            "restaurant_lon": restaurant_lon,
+            "delivery_lat": delivery_lat,
+            "delivery_lon": delivery_lon,
+            "age": age,
+            "ratings": ratings,
+            "vehicle_condition": vehicle_condition,
+            "weather": weather,
+            "traffic": traffic,
+            "vehicle_type": vehicle_type,
+            "order_type": order_type,
+            "festival": festival,
+            "city": city,
+        }
+        X = build_feature_row(order)
+        predicted_minutes = float(linear_model.predict(X)[0])
+        late_proba = float(logistic_model.predict_proba(X)[0][1])
+        is_late = late_proba >= 0.5
+
+        context = make_model_context(order, X, predicted_minutes, late_proba, is_late)
+        st.session_state.last_context = context
+
+        coefs = pd.Series(logistic_model.coef_[0], index=FEATURE_ORDER)
+        contributions = (coefs * X.iloc[0]).sort_values(key=np.abs, ascending=False)
+        top = contributions[contributions != 0].head(6)
+
+        insights, ai_error = None, None
+        if OPENROUTER_API_KEY:
+            with st.spinner("Writing manager advice..."):
+                insights, ai_error = generate_manager_insights(context)
+            st.session_state.last_ai_insights = insights
+            st.session_state.last_ai_error = ai_error
+
+        st.session_state.manual_result = {
+            "minutes": predicted_minutes,
+            "prob": late_proba * 100,
+            "late": bool(is_late),
+            "drivers": [(name, "Increases risk" if v > 0 else "Decreases risk") for name, v in top.items()],
+            "features": X.T.rename(columns={0: "value"}),
+            "insights": insights,
+            "ai_error": ai_error,
+            "has_key": bool(OPENROUTER_API_KEY),
+        }
+
+    res = st.session_state.manual_result
+    if res:
+        st.markdown('<div class="zw-h">Result</div>', unsafe_allow_html=True)
+        render_tiles(res["minutes"], res["prob"], res["late"])
+        if res["late"]:
+            st.warning(
+                f"Flagged as likely late: predicted delivery time is {res['minutes']:.0f} minutes "
+                f"against the {LATE_THRESHOLD}-minute limit."
+            )
         else:
-            st.markdown(insights)
-    else:
-        st.divider()
-        st.subheader("🤖 AI Manager Knowledge")
-        st.info(
-            "The ML prediction is complete. Add an LLM API key in Streamlit Secrets "
-            "to generate descriptive and prescriptive knowledge."
-        )
+            st.success(
+                f"Flagged as likely on time: predicted delivery time is {res['minutes']:.0f} minutes "
+                f"against the {LATE_THRESHOLD}-minute limit."
+            )
+
+        st.markdown('<div class="zw-h">What is driving this prediction</div>', unsafe_allow_html=True)
+        if res["drivers"]:
+            st.table(pd.DataFrame(res["drivers"], columns=["Factor", "Effect on late risk"]))
+            st.caption(
+                "The active inputs with the largest push, up or down, on the late-delivery score."
+            )
+        else:
+            st.caption("No single input stands out strongly for this order.")
+
+        with st.expander("See the exact values sent to the models"):
+            st.dataframe(res["features"])
+
+        st.markdown('<div class="zw-h">Advice for the manager</div>', unsafe_allow_html=True)
+        if not res["has_key"]:
+            st.info("Add an OPENROUTER_API_KEY in Streamlit Secrets to get written advice with each prediction.")
+        elif res["ai_error"]:
+            st.info("The prediction is ready, but the written advice couldn't be generated. Submit again in a minute.")
+        elif res["insights"]:
+            st.markdown(res["insights"])
+
+
+# =============================================================================
+# ROUTER
+# =============================================================================
+if st.session_state.mode == "ai":
+    render_ai_mode()
+elif st.session_state.mode == "manual":
+    render_manual_mode()
 
 st.divider()
 st.caption(
-    "Built for the Zwigato delivery-delay case study. Linear regression estimates delivery "
-    "minutes; logistic regression estimates the probability of a late delivery, defined as "
-    f"delivery time exceeding {LATE_THRESHOLD} minutes — a business rule set for this study, "
-    "not a fixed SLA."
+    "Linear regression estimates delivery minutes; logistic regression estimates the chance of a late delivery, "
+    f"defined as delivery taking more than {LATE_THRESHOLD} minutes (a business rule for this case study, not a fixed SLA). "
+    "The ML models make the prediction; the AI layer only explains it."
 )
