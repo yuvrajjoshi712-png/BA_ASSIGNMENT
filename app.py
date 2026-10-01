@@ -192,7 +192,47 @@ def clean_secret(value: Optional[str]) -> Optional[str]:
 # The app supports both providers. If Gemini is configured, it is used first;
 # otherwise OpenRouter is used. Gemini 2.5 Flash-Lite currently has a free tier.
 OPENROUTER_API_KEY = clean_secret(get_secret("OPENROUTER_API_KEY"))
-OPENROUTER_MODEL = get_secret("OPENROUTER_MODEL", "openrouter/free")
+
+# Use a specific free model instead of openrouter/free for more predictable
+# demo behaviour. The free router selects a model at random and can occasionally
+# return an empty completion. If the user has the old value in Secrets, we
+# transparently replace it with the stable free model below.
+OPENROUTER_MODEL = get_secret("OPENROUTER_MODEL", "qwen/qwen3.8-27b:free")
+if OPENROUTER_MODEL.strip() == "openrouter/free":
+    OPENROUTER_MODEL = "qwen/qwen3.8-27b:free"
+
+# Free fallback models in case the primary free endpoint is temporarily
+# unavailable or returns an empty completion. All remain on OpenRouter.
+OPENROUTER_FALLBACK_MODELS = [
+    "qwen/qwen3.8-27b:free",
+    "deepseek/deepseek-v4-flash-0731:free",
+    "deepseek/deepseek-chat:free",
+]
+
+
+def _extract_text_from_openrouter_response(data: dict) -> str:
+    """Read normal Chat Completions text robustly."""
+    choices = data.get("choices") or []
+    if not choices:
+        return ""
+
+    message = choices[0].get("message") or {}
+    content = message.get("content")
+
+    if isinstance(content, str):
+        return content.strip()
+
+    # Some OpenAI-compatible responses may expose content as a list of blocks.
+    if isinstance(content, list):
+        pieces = []
+        for block in content:
+            if isinstance(block, dict):
+                text = block.get("text")
+                if isinstance(text, str):
+                    pieces.append(text)
+        return "".join(pieces).strip()
+
+    return ""
 
 
 def call_openrouter(
@@ -201,7 +241,7 @@ def call_openrouter(
     temperature: float = 0.2,
     max_tokens: int = 900,
 ) -> Tuple[Optional[str], Optional[str]]:
-    """Call OpenRouter directly. The existing ML model is not changed here."""
+    """Call OpenRouter directly without changing the existing ML model."""
     if not OPENROUTER_API_KEY:
         return None, "OPENROUTER_API_KEY is not configured in Streamlit Secrets."
 
@@ -212,49 +252,75 @@ def call_openrouter(
     headers = {
         "Authorization": "Bearer " + api_key,
         "Content-Type": "application/json",
+        "Accept": "application/json",
         "HTTP-Referer": "https://streamlit.io/",
         "X-Title": "Zwigato Delivery Delay Predictor",
     }
-    payload = {
-        "model": OPENROUTER_MODEL,
-        "messages": [{"role": "system", "content": system}] + messages,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-    }
 
-    try:
-        response = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers=headers,
-            json=payload,
-            timeout=45,
-        )
-    except requests.RequestException as exc:
-        return None, f"OpenRouter request failed: {exc}"
+    # Try the configured model first, then a couple of current free fallbacks.
+    models_to_try = [OPENROUTER_MODEL] + [
+        m for m in OPENROUTER_FALLBACK_MODELS if m != OPENROUTER_MODEL
+    ]
 
-    if response.status_code == 401:
-        return None, (
-            "OpenRouter authentication failed (HTTP 401). Check Streamlit Secrets: "
-            "OPENROUTER_API_KEY must contain only the key value, without 'Bearer '."
-        )
+    errors = []
 
-    if not response.ok:
+    for model_name in models_to_try:
+        payload = {
+            "model": model_name,
+            "messages": [{"role": "system", "content": system}] + messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            # Prevent thinking-only responses for this application. We need the
+            # final answer text / JSON, not a reasoning-only completion.
+            "reasoning": {"enabled": False},
+        }
+
         try:
-            body = response.json()
-        except ValueError:
-            body = response.text[:1000]
-        return None, f"OpenRouter HTTP {response.status_code}: {body}"
+            response = requests.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=45,
+            )
+        except requests.RequestException as exc:
+            errors.append(f"{model_name}: request failed: {exc}")
+            continue
 
-    try:
-        data = response.json()
-        text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-    except (ValueError, KeyError, IndexError, TypeError) as exc:
-        return None, f"Could not read OpenRouter response: {exc}"
+        if response.status_code == 401:
+            return None, (
+                "OpenRouter authentication failed (HTTP 401). Check Streamlit Secrets: "
+                "OPENROUTER_API_KEY must contain only the key value, without 'Bearer '."
+            )
 
-    if not text:
-        return None, "OpenRouter returned an empty response."
+        if not response.ok:
+            try:
+                body = response.json()
+            except ValueError:
+                body = response.text[:1000]
+            errors.append(f"{model_name}: HTTP {response.status_code}: {body}")
+            continue
 
-    return text.strip(), None
+        try:
+            data = response.json()
+        except ValueError as exc:
+            errors.append(f"{model_name}: invalid JSON response: {exc}")
+            continue
+
+        text = _extract_text_from_openrouter_response(data)
+
+        if text:
+            return text, None
+
+        # Empty completion: try the next free endpoint rather than surfacing
+        # an opaque error to the user. OpenRouter documents that empty outputs
+        # can occur on provider responses.
+        errors.append(f"{model_name}: empty completion")
+
+    return None, (
+        "OpenRouter could not return a text response from the available free models. "
+        "Please try the question again in a moment. "
+        + " | ".join(errors[-3:])
+    )
 
 
 def call_llm(
