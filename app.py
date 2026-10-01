@@ -578,7 +578,7 @@ st.markdown(
   --red:#E23744; --red-soft:#FFF1F2; --green:#157F54; --green-soft:#E8F6EF; --amber:#B54708; --amber-soft:#FEF0E3;
 }
 .stApp{ background:var(--canvas); font-family:'Manrope',system-ui,-apple-system,'Segoe UI',sans-serif; color:var(--ink); }
-.block-container{ max-width:820px; padding-top:2.2rem; padding-bottom:6rem; }
+.block-container{ max-width:820px; padding-top:5.5rem !important; padding-bottom:7rem; }
 #MainMenu, footer{ visibility:hidden; }
 
 /* Header */
@@ -619,7 +619,8 @@ st.markdown(
 .stButton > button, [data-testid="stFormSubmitButton"] > button{ border-radius:10px; font-weight:600; }
 button[data-testid="stBaseButton-primary"], button[data-testid="stBaseButton-primaryFormSubmit"]{ background:var(--red); border-color:var(--red); }
 button[data-testid="stBaseButton-primary"]:hover, button[data-testid="stBaseButton-primaryFormSubmit"]:hover{ background:#C42B38; border-color:#C42B38; }
-:focus-visible{ outline:2px solid var(--red) !important; outline-offset:2px; }
+button:focus-visible, a:focus-visible{ outline:2px solid var(--red) !important; outline-offset:2px; }
+textarea:focus-visible, input:focus-visible{ outline:none !important; }
 </style>
 """,
     unsafe_allow_html=True,
